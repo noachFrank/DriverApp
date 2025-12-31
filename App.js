@@ -30,6 +30,8 @@ import { View, ActivityIndicator, StyleSheet, StatusBar } from 'react-native';
 import { AuthProvider, useAuth } from './src/contexts/AuthContext';
 import { ThemeProvider, useTheme } from './src/contexts/ThemeContext';
 import { WaitTimeProvider } from './src/contexts/WaitTimeContext';
+import { NotificationProvider } from './src/contexts/NotificationContext';
+import { AlertProvider } from './src/contexts/AlertContext';
 
 // Import our screens
 import LoginScreen from './src/screens/LoginScreen';
@@ -93,17 +95,29 @@ const AppContent = () => {
 /**
  * App - The root component
  * 
- * This wraps everything in AuthProvider and ThemeProvider so that any component
- * can access authentication state and theme using useAuth() and useTheme().
+ * This wraps everything in providers so that any component
+ * can access authentication state, theme, wait time, and notifications
+ * using their respective hooks.
+ * 
+ * PROVIDER ORDER:
+ * - ThemeProvider: Must be outermost for consistent theming
+ * - AlertProvider: Provides custom alerts and toasts globally
+ * - AuthProvider: Manages login/logout and initializes push notifications
+ * - NotificationProvider: Handles push notification navigation (depends on auth)
+ * - WaitTimeProvider: Tracks wait time for active calls
  */
 const App = () => {
   return (
     <ThemeProvider>
-      <AuthProvider>
-        <WaitTimeProvider>
-          <AppContent />
-        </WaitTimeProvider>
-      </AuthProvider>
+      <AlertProvider>
+        <AuthProvider>
+          <NotificationProvider>
+            <WaitTimeProvider>
+              <AppContent />
+            </WaitTimeProvider>
+          </NotificationProvider>
+        </AuthProvider>
+      </AlertProvider>
     </ThemeProvider>
   );
 };

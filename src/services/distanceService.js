@@ -2,13 +2,15 @@
  * Distance Service for DriverApp
  * 
  * Calculates distance from user's location to pickup addresses
- * using Google Distance Matrix API.
+ * by calling the server API (which proxies to Google Distance Matrix API).
+ * 
+ * This approach avoids CORS issues and keeps the API key secure on the server.
  */
 
-import { GOOGLE_MAPS_API_KEY } from '../config/googleMapsConfig';
+import config, { apiClient } from '../config/apiConfig';
 
 /**
- * Calculate distance from origin to destination using Distance Matrix API
+ * Calculate distance from origin to destination using server API
  * @param {object} origin - { latitude, longitude }
  * @param {string} destination - Address string
  * @returns {Promise<{distance: string, duration: string, error?: string}>}
@@ -19,36 +21,32 @@ export const calculateDistanceToPickup = async (origin, destination) => {
     }
 
     try {
-        const originStr = `${origin.latitude},${origin.longitude}`;
-        const destinationEncoded = encodeURIComponent(destination);
+        console.log('Calculating distance via server API:', {
+            originLat: origin.latitude,
+            originLng: origin.longitude,
+            destination
+        });
 
-        const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${originStr}&destinations=${destinationEncoded}&units=imperial&key=${GOOGLE_MAPS_API_KEY}`;
+        const response = await apiClient.post(config.ENDPOINTS.RIDES.CALCULATE_DISTANCE, {
+            originLatitude: origin.latitude,
+            originLongitude: origin.longitude,
+            destinationAddress: destination
+        });
 
-        const response = await fetch(url);
-        const data = await response.json();
+        const data = response.data;
 
-        // Log full response for debugging
-        console.log('Distance Matrix API full response:', JSON.stringify(data));
-
-        if (data.status !== 'OK') {
-            // Log error message if available
-            if (data.error_message) {
-                console.error('Distance Matrix API error:', data.error_message);
-            }
-            return { distance: null, duration: null, error: data.status, errorMessage: data.error_message };
+        if (data.error) {
+            console.error('Distance calculation error from server:', data.error, data.errorMessage || '');
+            return { distance: null, duration: null, error: data.error, errorMessage: data.errorMessage };
         }
 
-        const element = data.rows[0]?.elements[0];
-
-        if (element?.status !== 'OK') {
-            return { distance: null, duration: null, error: element?.status || 'No route found' };
-        }
+        console.log('Distance calculation result:', data);
 
         return {
-            distance: element.distance.text,  // e.g., "5.2 mi"
-            duration: element.duration.text,  // e.g., "12 mins"
-            distanceValue: element.distance.value,  // meters
-            durationValue: element.duration.value,  // seconds
+            distance: data.distance,      // e.g., "5.2 mi"
+            duration: data.duration,      // e.g., "12 mins"
+            distanceValue: data.distanceValue,  // meters
+            durationValue: data.durationValue,  // seconds
             error: null
         };
     } catch (error) {

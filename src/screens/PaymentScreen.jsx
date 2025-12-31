@@ -31,30 +31,78 @@ import {
     TextInput,
     ScrollView,
     ActivityIndicator,
-    Modal,
-    Alert
+    Modal
 } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWaitTime } from '../contexts/WaitTimeContext';
-import { ridesAPI } from '../services/apiService';
+import { useAlert } from '../contexts/AlertContext';
+import { ridesAPI, paymentAPI } from '../services/apiService';
+import SquareCardTokenizer from '../components/SquareCardTokenizer';
 
-const WAIT_TIME_RATE = 1; // $1 per minute
+// Payment method options
+const PAYMENT_OPTIONS = [
+    { value: 'cash', label: '💵 Cash' },
+    { value: 'zelle', label: '📱 Zelle' },
+    { value: 'drivercc', label: '💳 Driver CC (enter card)' },
+    { value: 'dispatchercc', label: '💳 Dispatcher CC (on file)' },
+];
+
+/**
+ * Wait time pricing per minute based on car type:
+ * - Sedan (Car), Minivan: $0.50/min
+ * - Lux SUV, 12-pass, 15-pass: $1.00/min
+ */
+const getWaitTimeRate = (carType) => {
+    // carType values from CarType.cs enum: Car=0, SUV=1, MiniVan=2, TwelvePass=3, FifteenPass=4, LuxurySUV=5
+    const carTypeNum = typeof carType === 'number' ? carType : parseInt(carType) || 0;
+    const carTypeName = typeof carType === 'string' ? carType.toLowerCase() : '';
+
+    // Premium car types: $1.00/min
+    if (carTypeNum === 3 || carTypeNum === 4 || carTypeNum === 5 ||
+        carTypeName === 'twelvepass' || carTypeName === 'fifteenpass' || carTypeName === 'luxurysuv' ||
+        carTypeName === '12pass' || carTypeName === '15pass' || carTypeName === 'lux suv') {
+        return 1.00;
+    }
+
+    // Standard car types: $0.50/min (Car, SUV, MiniVan)
+    return 0.50;
+};
 
 const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, waitTimeMinutes = 0, onComplete }) => {
     const { theme } = useTheme();
     const colors = theme.colors;
     const { clearTimer } = useWaitTime();
+    const { showAlert, showToast } = useAlert();
     const [loading, setLoading] = useState(false);
     const [showSuccessModal, setShowSuccessModal] = useState(false);
-    const [tipSaving, setTipSaving] = useState(false);
+
+    // Get wait time rate based on car type from call data
+    const waitTimeRate = getWaitTimeRate(call?.carType);
+
+    // Payment method state - initialize based on dispatcher input
+    const getInitialPaymentMethod = () => {
+        const normalized = paymentType?.toLowerCase() || 'cash';
+        if (normalized === 'zelle') return 'zelle';
+        if (normalized === 'dispatchercc') return 'dispatchercc';
+        if (normalized === 'drivercc' || normalized === 'cc') return 'drivercc';
+        return 'cash'; // Default to cash for cash, check, voucher, etc.
+    };
+    const [selectedPaymentMethod, setSelectedPaymentMethod] = useState(getInitialPaymentMethod());
+    const [showPaymentPicker, setShowPaymentPicker] = useState(false);
+
+    // Editable wait time state
+    const [editingWaitTime, setEditingWaitTime] = useState(false);
+    const [waitTimeValue, setWaitTimeValue] = useState(waitTimeMinutes.toString());
+    const [savedWaitTimeMinutes, setSavedWaitTimeMinutes] = useState(waitTimeMinutes);
     const [waitTimeSaving, setWaitTimeSaving] = useState(false);
-
-    // Tip state
-    const [tipAmount, setTipAmount] = useState('');
-    const [tipSaved, setTipSaved] = useState(false);
-
-    // Wait time state
     const [waitTimeSaved, setWaitTimeSaved] = useState(false);
+
+    // Editable tip state
+    const [editingTip, setEditingTip] = useState(false);
+    const [tipValue, setTipValue] = useState('0');
+    const [savedTip, setSavedTip] = useState(0);
+    const [tipSaving, setTipSaving] = useState(false);
+    const [tipSaved, setTipSaved] = useState(false);
 
     // Credit card form state
     const [ccNumber, setCcNumber] = useState('');
@@ -62,97 +110,185 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
     const [ccCvv, setCcCvv] = useState('');
     const [ccName, setCcName] = useState('');
 
-    const normalizedPaymentType = paymentType?.toLowerCase() || 'cash';
-    const isCC = normalizedPaymentType === 'drivercc' || normalizedPaymentType === 'dispatchercc';
+    // Square tokenization state
+    const [squareToken, setSquareToken] = useState(null);
+    const [tokenizing, setTokenizing] = useState(false);
+    const [showSquareTokenizer, setShowSquareTokenizer] = useState(false);
 
-    // Only show CC input fields for "Driver CC" - other CC types are charged by dispatch
-    const isDriverCC = normalizedPaymentType === 'drivercc';
+    // Derived payment method flags
+    const isDriverCC = selectedPaymentMethod === 'drivercc';
+    const isDispatcherCC = selectedPaymentMethod === 'dispatchercc';
+    const isCC = isDriverCC || isDispatcherCC;
+    const isZelle = selectedPaymentMethod === 'zelle';
+    const isCash = selectedPaymentMethod === 'cash';
 
-    // Calculate totals
+    // Calculate totals - only include SAVED values, use car-type-specific rate
     const baseCost = typeof cost === 'number' ? cost : 0;
-    const parsedTip = parseFloat(tipAmount) || 0;
-    const waitTimeCost = waitTimeMinutes * WAIT_TIME_RATE;
-    const totalCost = baseCost + parsedTip + waitTimeCost;
+    const waitTimeCost = savedWaitTimeMinutes * waitTimeRate;
+    const subtotal = baseCost + savedTip + waitTimeCost;
 
-    // Auto-save wait time when component mounts (if there's wait time)
+    // Add 4% CC processing fee for any CC payment type
+    const ccFeeRate = 0.04;
+    const ccFee = isCC ? subtotal * ccFeeRate : 0;
+    const totalCost = subtotal + ccFee;
+
+    // Auto-save wait time when component mounts (if there's initial wait time and not saved yet)
     useEffect(() => {
-        const saveWaitTime = async () => {
+        const saveInitialWaitTime = async () => {
             if (waitTimeMinutes > 0 && !waitTimeSaved) {
                 setWaitTimeSaving(true);
                 try {
-                    console.log('Saving wait time for ride:', rideId, 'Amount:', waitTimeCost);
-                    await ridesAPI.addWaitTime(rideId, Math.round(waitTimeCost));
+                    console.log('Saving initial wait time for ride:', rideId, 'Minutes:', waitTimeMinutes, 'Rate:', waitTimeRate);
+                    // Save the dollar amount (minutes * rate)
+                    await ridesAPI.addWaitTime(rideId, Math.round(waitTimeMinutes * waitTimeRate * 100) / 100);
                     setWaitTimeSaved(true);
-                    console.log('Wait time saved successfully');
+                    setSavedWaitTimeMinutes(waitTimeMinutes);
+                    console.log('Initial wait time saved successfully');
                 } catch (error) {
-                    console.error('Error saving wait time:', error);
-                    // Don't show alert, just log - we can retry later
+                    console.error('Error saving initial wait time:', error);
                 } finally {
                     setWaitTimeSaving(false);
                 }
             }
         };
 
-        saveWaitTime();
-    }, [rideId, waitTimeMinutes, waitTimeCost, waitTimeSaved]);
+        saveInitialWaitTime();
+    }, [rideId, waitTimeMinutes, waitTimeSaved]);
+
+    // Clear Square token when switching away from Driver CC
+    useEffect(() => {
+        if (selectedPaymentMethod !== 'drivercc' && squareToken) {
+            console.log('Clearing Square token - payment method changed from Driver CC');
+            setSquareToken(null);
+        }
+    }, [selectedPaymentMethod]);
+
+    // Update price when payment method changes (add/remove 4% CC fee)
+    useEffect(() => {
+        const updatePriceForPaymentMethod = async () => {
+            try {
+                // Calculate the new total based on payment method
+                const currentSubtotal = baseCost + savedTip + (savedWaitTimeMinutes * waitTimeRate);
+                const currentCcFee = isCC ? currentSubtotal * ccFeeRate : 0;
+                const newTotal = currentSubtotal + currentCcFee;
+
+                // Calculate driver's compensation: base comp + 100% of tips + 85% of wait time
+                const baseDriverComp = call?.driversCompensation || baseCost;
+                const waitTimeCostNow = savedWaitTimeMinutes * waitTimeRate;
+                const driverWaitTimeShare = waitTimeCostNow * 0.85; // Driver gets 85% of wait time
+                const driversComp = baseDriverComp + savedTip + driverWaitTimeShare;
+
+                console.log('Updating price for payment method change. CC:', isCC, 'New Total:', newTotal, 'Driver Comp:', driversComp);
+
+                // Update the price in the database with both total and driver compensation
+                await ridesAPI.updatePrice(rideId, newTotal, driversComp);
+                console.log('Price updated successfully');
+            } catch (error) {
+                console.error('Error updating price for payment method:', error);
+            }
+        };
+
+        // Only update if we have a valid rideId and cost
+        if (rideId && baseCost > 0) {
+            updatePriceForPaymentMethod();
+        }
+    }, [selectedPaymentMethod, isCC]);
 
     /**
-     * Get display name for payment type
+     * Handle saving/updating wait time
      */
-    const getPaymentDisplayName = () => {
-        switch (normalizedPaymentType) {
-            case 'cash':
-                return '💵 Cash';
-            case 'check':
-                return '📝 Check';
-            case 'drivercc':
-                return '💳 Driver CC';
-            case 'dispatchercc':
-                return '💳 Dispatcher CC';
-            default:
-                return `💵 ${paymentType || 'Cash'}`;
+    const handleSaveWaitTime = async () => {
+        const minutes = parseInt(waitTimeValue) || 0;
+        setWaitTimeSaving(true);
+        try {
+            console.log('Saving wait time for ride:', rideId, 'Minutes:', minutes, 'Rate:', waitTimeRate);
+            // Save the dollar amount (minutes * rate)
+            await ridesAPI.addWaitTime(rideId, Math.round(minutes * waitTimeRate * 100) / 100);
+            setSavedWaitTimeMinutes(minutes);
+            setWaitTimeSaved(true);
+            setEditingWaitTime(false);
+
+            // Recalculate total and driver compensation
+            // Driver gets: base comp + 100% of tips + 85% of wait time
+            const baseDriverComp = call?.driversCompensation || baseCost;
+            const waitTimeCostNow = minutes * waitTimeRate;
+            const driverWaitTimeShare = waitTimeCostNow * 0.85; // Driver gets 85% of wait time
+            const newDriversComp = baseDriverComp + savedTip + driverWaitTimeShare;
+
+            const newSubtotal = baseCost + savedTip + waitTimeCostNow;
+            const newCcFee = isCC ? newSubtotal * ccFeeRate : 0;
+            const newTotal = newSubtotal + newCcFee;
+
+            console.log('Updating price after wait time change. New Total:', newTotal, 'Driver Comp:', newDriversComp);
+            await ridesAPI.updatePrice(rideId, newTotal, newDriversComp);
+
+            showToast(`Wait time updated to ${minutes} min ($${(minutes * waitTimeRate).toFixed(2)})`, 'success');
+        } catch (error) {
+            console.error('Error saving wait time:', error);
+            showAlert('Error', 'Failed to save wait time. Please try again.', [{ text: 'OK' }]);
+        } finally {
+            setWaitTimeSaving(false);
         }
     };
 
     /**
-     * Handle saving the tip
+     * Handle saving/updating tip
      */
     const handleSaveTip = async () => {
-        if (!tipAmount || parsedTip <= 0) {
-            Alert.alert('Invalid Tip', 'Please enter a valid tip amount.');
-            return;
-        }
-
+        const tipAmount = parseFloat(tipValue) || 0;
         setTipSaving(true);
         try {
-            console.log('Saving tip for ride:', rideId, 'Amount:', parsedTip);
-            await ridesAPI.addTip(rideId, Math.round(parsedTip)); // API expects integer
+            console.log('Saving tip for ride:', rideId, 'Amount:', tipAmount);
+            await ridesAPI.addTip(rideId, Math.round(tipAmount));
+            setSavedTip(tipAmount);
             setTipSaved(true);
-            Alert.alert('Tip Saved', `Tip of $${parsedTip.toFixed(2)} has been added to the ride.`);
+            setEditingTip(false);
+
+            // Recalculate total and driver compensation
+            // Driver gets: base comp + 100% of tips + 85% of wait time
+            const baseDriverComp = call?.driversCompensation || baseCost;
+            const waitTimeCostNow = savedWaitTimeMinutes * waitTimeRate;
+            const driverWaitTimeShare = waitTimeCostNow * 0.85; // Driver gets 85% of wait time
+            const newDriversComp = baseDriverComp + tipAmount + driverWaitTimeShare;
+
+            const newSubtotal = baseCost + tipAmount + waitTimeCostNow;
+            const newCcFee = isCC ? newSubtotal * ccFeeRate : 0;
+            const newTotal = newSubtotal + newCcFee;
+
+            console.log('Updating price after tip change. New Total:', newTotal, 'Driver Comp:', newDriversComp);
+            await ridesAPI.updatePrice(rideId, newTotal, newDriversComp);
+
+            showToast(`Tip of $${tipAmount.toFixed(2)} saved`, 'success');
         } catch (error) {
             console.error('Error saving tip:', error);
-            Alert.alert('Error', 'Failed to save tip. Please try again.');
+            showAlert('Error', 'Failed to save tip. Please try again.', [{ text: 'OK' }]);
         } finally {
             setTipSaving(false);
         }
     };
 
     /**
-     * Format tip input - only allow numbers and decimal
+     * Cancel wait time editing
      */
-    const formatTipInput = (text) => {
-        // Remove non-numeric except decimal point
-        const cleaned = text.replace(/[^0-9.]/g, '');
-        // Only allow one decimal point
-        const parts = cleaned.split('.');
-        if (parts.length > 2) {
-            return parts[0] + '.' + parts.slice(1).join('');
-        }
-        // Limit to 2 decimal places
-        if (parts[1]?.length > 2) {
-            return parts[0] + '.' + parts[1].slice(0, 2);
-        }
-        return cleaned;
+    const handleCancelWaitTimeEdit = () => {
+        setWaitTimeValue(savedWaitTimeMinutes.toString());
+        setEditingWaitTime(false);
+    };
+
+    /**
+     * Cancel tip editing
+     */
+    const handleCancelTipEdit = () => {
+        setTipValue(savedTip.toString());
+        setEditingTip(false);
+    };
+
+    /**
+     * Get display name for selected payment method
+     */
+    const getPaymentDisplayName = () => {
+        const option = PAYMENT_OPTIONS.find(opt => opt.value === selectedPaymentMethod);
+        return option?.label || '💵 Cash';
     };
 
     /**
@@ -180,25 +316,244 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
     };
 
     /**
-     * Handle charging the credit card
-     * TODO: Implement actual CC processing later
+     * Handle charging the credit card or opening tokenizer for Driver CC
      */
     const handleCharge = async () => {
-        setLoading(true);
-        try {
-            console.log('Charging CC for ride:', rideId);
-            console.log('CC Details:', { ccNumber: ccNumber.slice(-4), ccExpiry, ccName });
+        // For Driver CC: Check if we need to tokenize first
+        if (isDriverCC) {
+            // If we don't have a token yet, show the Square tokenizer
+            if (!squareToken) {
+                console.log('No Square token - opening tokenizer modal');
+                setShowSquareTokenizer(true);
+                return;
+            }
 
-            // TODO: Implement actual CC processing
-            // For now, simulate processing and show success
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            // We have a token - charge the card
+            setLoading(true);
+            try {
+                console.log('Charging with Square token:', squareToken);
 
-            // Show success modal
-            setShowSuccessModal(true);
-        } catch (error) {
-            console.error('Error charging card:', error);
-        } finally {
-            setLoading(false);
+                // Charge using the Square token
+                const result = await paymentAPI.chargeCard(
+                    squareToken,
+                    totalCost,
+                    rideId,
+                    `Payment for ride #${rideId}`
+                );
+
+                // Check result and handle accordingly
+                if (result.success) {
+                    console.log('✅ Driver CC payment successful! Payment ID:', result.paymentId);
+                    showToast('Payment processed successfully!', 'success');
+                    setShowSuccessModal(true);
+                } else {
+                    // Payment failed - handle error
+                    console.error('❌ Driver CC payment failed:', result.message, 'Error code:', result.errorCode);
+
+                    // Customize alert based on error type
+                    const errorCode = result.errorCode || 'UNKNOWN';
+                    let title = 'Payment Failed';
+                    let message = result.message || 'Unable to process payment.';
+                    let buttons = [];
+
+                    switch (errorCode) {
+                        case 'CARD_DECLINED':
+                        case 'INSUFFICIENT_FUNDS':
+                            title = '💳 Card Declined';
+                            message = result.message + '\n\nPlease ask the customer for a different card, or change to cash/Zelle payment.';
+                            buttons = [
+                                {
+                                    text: 'Try Different Card',
+                                    onPress: () => {
+                                        setSquareToken(null);
+                                        setShowSquareTokenizer(true);
+                                    }
+                                },
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                },
+                                { text: 'Cancel' }
+                            ];
+                            break;
+
+                        case 'CVV_FAILURE':
+                        case 'CARD_EXPIRED':
+                        case 'INVALID_CARD':
+                        case 'TOKENIZATION_FAILED':
+                            title = '⚠️ Invalid Card';
+                            message = result.message + '\n\nPlease verify the card details are correct.';
+                            buttons = [
+                                {
+                                    text: 'Try Different Card',
+                                    onPress: () => {
+                                        setSquareToken(null);
+                                        setShowSquareTokenizer(true);
+                                    }
+                                },
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                }
+                            ];
+                            break;
+
+                        case 'TOKEN_USED':
+                        case 'TOKEN_EXPIRED':
+                            title = '⚠️ Card Already Used';
+                            message = result.message + '\n\nPlease enter the card details again.';
+                            buttons = [
+                                {
+                                    text: 'Enter Card Again',
+                                    onPress: () => {
+                                        setSquareToken(null);
+                                        setShowSquareTokenizer(true);
+                                    }
+                                },
+                                { text: 'Cancel' }
+                            ];
+                            break;
+
+                        default:
+                            // Generic error - allow retry
+                            buttons = [
+                                {
+                                    text: 'Retry',
+                                    onPress: () => handleCharge()
+                                },
+                                {
+                                    text: 'Try Different Card',
+                                    onPress: () => {
+                                        setSquareToken(null);
+                                        setShowSquareTokenizer(true);
+                                    }
+                                },
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                }
+                            ];
+                            break;
+                    }
+
+                    showAlert(title, message, buttons);
+                }
+            } catch (error) {
+                console.error('Error charging Driver CC:', error);
+                showToast('Something went wrong while processing the payment. Please try again.', 'error');
+            } finally {
+                setLoading(false);
+            }
+            return; // Exit - Driver CC flow complete
+        }
+
+        // For Dispatcher CC: use token from ride data
+        if (isDispatcherCC) {
+            const tokenToCharge = call?.paymentTokenId;
+            if (!tokenToCharge) {
+                showToast('No card on file for this ride.\nPlease change the payment method or contact dispatch.', 'error', 5000);
+                return;
+            }
+            console.log('Using dispatcher CC token:', tokenToCharge);
+
+            setLoading(true);
+            try {
+                // Charge the card using the token
+                console.log('Charging card for ride:', rideId, 'Amount:', totalCost);
+                const result = await paymentAPI.chargeCard(
+                    tokenToCharge,
+                    totalCost,
+                    rideId,
+                    `Payment for ride #${rideId}`
+                );
+
+                if (result.success) {
+                    console.log('✅ Payment successful! Payment ID:', result.paymentId);
+                    showToast('Payment processed successfully!', 'success');
+
+                    // Show success modal
+                    setShowSuccessModal(true);
+                } else {
+                    // Payment failed - handle different error types
+                    console.error('❌ Payment failed:', result.message, 'Error code:', result.errorCode);
+
+                    // Customize alert based on error type
+                    const errorCode = result.errorCode || 'UNKNOWN';
+                    let title = 'Payment Failed';
+                    let message = result.message || 'Unable to process payment.';
+                    let buttons = [];
+
+                    switch (errorCode) {
+                        case 'TOKEN_USED':
+                        case 'TOKEN_EXPIRED':
+                            // Token already used or expired - need new card from dispatch
+                            title = '⚠️ Payment Card Issue';
+                            message = result.message + '\n\nYou cannot retry with the same card. Please contact dispatch to update the payment method.';
+                            buttons = [
+                                {
+                                    text: 'Contact Dispatch',
+                                    onPress: () => {
+                                        // TODO: Open messaging or call dispatch
+                                        showToast('Please call dispatch to update the payment method', 'info');
+                                    }
+                                },
+                                {
+                                    text: 'Use Different Payment',
+                                    onPress: () => setShowPaymentPicker(true)
+                                }
+                            ];
+                            break;
+
+                        case 'CARD_DECLINED':
+                        case 'INSUFFICIENT_FUNDS':
+                            title = '💳 Card Declined';
+                            message = result.message + '\n\nPlease ask the customer for a different card, or change to cash/Zelle payment.';
+                            buttons = [
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                },
+                                { text: 'Cancel' }
+                            ];
+                            break;
+
+                        case 'CVV_FAILURE':
+                        case 'CARD_EXPIRED':
+                        case 'INVALID_CARD':
+                            title = '⚠️ Invalid Card';
+                            message = result.message + '\n\nPlease contact dispatch to verify the card details or use a different payment method.';
+                            buttons = [
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                },
+                                { text: 'Cancel' }
+                            ];
+                            break;
+
+                        default:
+                            // Generic error - allow retry
+                            buttons = [
+                                {
+                                    text: 'Retry',
+                                    onPress: () => handleCharge()
+                                },
+                                {
+                                    text: 'Change Payment Method',
+                                    onPress: () => setShowPaymentPicker(true)
+                                }
+                            ];
+                            break;
+                    }
+
+                    showAlert(title, message, buttons);
+                }
+            } catch (error) {
+                console.error('Error charging card:', error);
+                showToast('Something went wrong while processing the payment. Please try again, or change the payment method.', 'error');
+            } finally {
+                setLoading(false);
+            }
         }
     };
 
@@ -249,30 +604,133 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
                         ${totalCost.toFixed(2)}
                     </Text>
 
-                    {/* Price Breakdown */}
+                    {/* Price Breakdown with Editable Fields */}
                     <View style={styles.priceBreakdown}>
+                        {/* Base Fare - Not editable */}
                         <View style={styles.breakdownRow}>
                             <Text style={[styles.breakdownLabel, { color: colors.textSecondary }]}>Base Fare</Text>
                             <Text style={[styles.breakdownValue, { color: colors.text }]}>${baseCost.toFixed(2)}</Text>
                         </View>
-                        {waitTimeCost > 0 && (
+
+                        {/* Wait Time - Editable */}
+                        <View style={styles.breakdownRow}>
+                            <Text style={[styles.breakdownLabel, { color: colors.textSecondary }]}>
+                                ⏱️ Wait Time (${waitTimeRate.toFixed(2)}/min)
+                            </Text>
+                            {editingWaitTime ? (
+                                <View style={styles.editableFieldRow}>
+                                    <TextInput
+                                        style={[styles.editableInput, { backgroundColor: colors.background, color: colors.text, borderColor: '#f39c12' }]}
+                                        value={waitTimeValue}
+                                        onChangeText={(text) => setWaitTimeValue(text.replace(/[^0-9]/g, ''))}
+                                        keyboardType="numeric"
+                                        placeholder="0"
+                                        placeholderTextColor={colors.textMuted}
+                                        autoFocus
+                                    />
+                                    <Text style={[styles.editableUnit, { color: colors.textSecondary }]}>min</Text>
+                                    <TouchableOpacity
+                                        style={[styles.confirmButton, waitTimeSaving && styles.buttonDisabled]}
+                                        onPress={handleSaveWaitTime}
+                                        disabled={waitTimeSaving}
+                                    >
+                                        {waitTimeSaving ? (
+                                            <ActivityIndicator size="small" color="#fff" />
+                                        ) : (
+                                            <Text style={styles.confirmButtonText}>✓</Text>
+                                        )}
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={styles.cancelEditButton}
+                                        onPress={handleCancelWaitTimeEdit}
+                                    >
+                                        <Text style={styles.cancelEditButtonText}>✕</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            ) : (
+                                <View style={styles.editableFieldRow}>
+                                    <Text style={[styles.breakdownValue, { color: '#f39c12' }]}>
+                                        +${waitTimeCost.toFixed(2)} ({savedWaitTimeMinutes} min)
+                                    </Text>
+                                    <TouchableOpacity
+                                        style={styles.editButton}
+                                        onPress={() => setEditingWaitTime(true)}
+                                    >
+                                        <Text style={styles.editButtonText}>✏️</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            )}
+                        </View>
+
+                        {/* Tip - Editable */}
+                        <View style={styles.breakdownRow}>
+                            <Text style={[styles.breakdownLabel, { color: colors.textSecondary }]}>
+                                💵 Tip
+                            </Text>
+                            {editingTip ? (
+                                <View style={styles.editableFieldRow}>
+                                    <Text style={[styles.editableDollar, { color: colors.text }]}>$</Text>
+                                    <TextInput
+                                        style={[styles.editableInput, { backgroundColor: colors.background, color: colors.text, borderColor: '#2ecc71' }]}
+                                        value={tipValue}
+                                        onChangeText={(text) => {
+                                            const cleaned = text.replace(/[^0-9.]/g, '');
+                                            const parts = cleaned.split('.');
+                                            if (parts.length > 2) return;
+                                            if (parts[1]?.length > 2) return;
+                                            setTipValue(cleaned);
+                                        }}
+                                        keyboardType="decimal-pad"
+                                        placeholder="0.00"
+                                        placeholderTextColor={colors.textMuted}
+                                        autoFocus
+                                    />
+                                    <TouchableOpacity
+                                        style={[styles.confirmButton, { backgroundColor: '#2ecc71' }, tipSaving && styles.buttonDisabled]}
+                                        onPress={handleSaveTip}
+                                        disabled={tipSaving}
+                                    >
+                                        {tipSaving ? (
+                                            <ActivityIndicator size="small" color="#fff" />
+                                        ) : (
+                                            <Text style={styles.confirmButtonText}>✓</Text>
+                                        )}
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                        style={styles.cancelEditButton}
+                                        onPress={handleCancelTipEdit}
+                                    >
+                                        <Text style={styles.cancelEditButtonText}>✕</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            ) : (
+                                <View style={styles.editableFieldRow}>
+                                    <Text style={[styles.breakdownValue, { color: '#2ecc71' }]}>
+                                        +${savedTip.toFixed(2)}
+                                    </Text>
+                                    <TouchableOpacity
+                                        style={styles.editButton}
+                                        onPress={() => setEditingTip(true)}
+                                    >
+                                        <Text style={styles.editButtonText}>✏️</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            )}
+                        </View>
+
+                        {/* CC Processing Fee - Only shown for CC payments */}
+                        {isCC && ccFee > 0 && (
                             <View style={styles.breakdownRow}>
                                 <Text style={[styles.breakdownLabel, { color: colors.textSecondary }]}>
-                                    Wait Time ({waitTimeMinutes} min)
+                                    💳 CC Fee (4%)
                                 </Text>
-                                <Text style={[styles.breakdownValue, { color: '#f39c12' }]}>
-                                    +${waitTimeCost.toFixed(2)}
-                                    {waitTimeSaving && ' ⏳'}
-                                    {waitTimeSaved && ' ✓'}
+                                <Text style={[styles.breakdownValue, { color: '#e74c3c' }]}>
+                                    +${ccFee.toFixed(2)}
                                 </Text>
                             </View>
                         )}
-                        {parsedTip > 0 && (
-                            <View style={styles.breakdownRow}>
-                                <Text style={[styles.breakdownLabel, { color: colors.textSecondary }]}>Tip</Text>
-                                <Text style={[styles.breakdownValue, { color: '#2ecc71' }]}>+${parsedTip.toFixed(2)}</Text>
-                            </View>
-                        )}
+
+                        {/* Total */}
                         <View style={[styles.breakdownRow, styles.breakdownTotal]}>
                             <Text style={[styles.breakdownTotalLabel, { color: colors.text }]}>Total</Text>
                             <Text style={[styles.breakdownTotalValue, { color: '#2ecc71' }]}>${totalCost.toFixed(2)}</Text>
@@ -280,109 +738,110 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
                     </View>
                 </View>
 
-                {/* Add Tip Section */}
-                <View style={[styles.tipSection, { backgroundColor: colors.card }]}>
-                    <Text style={[styles.tipSectionTitle, { color: colors.text }]}>💵 Add Tip</Text>
-                    <View style={styles.tipInputRow}>
-                        <Text style={[styles.tipDollarSign, { color: colors.text }]}>$</Text>
-                        <TextInput
-                            style={[styles.tipInput, { backgroundColor: colors.background, color: colors.text, borderColor: colors.divider }]}
-                            placeholder="0.00"
-                            placeholderTextColor={colors.textMuted}
-                            value={tipAmount}
-                            onChangeText={(text) => setTipAmount(formatTipInput(text))}
-                            keyboardType="decimal-pad"
-                            editable={!tipSaved}
-                        />
-                        <TouchableOpacity
-                            style={[
-                                styles.saveTipButton,
-                                { backgroundColor: tipSaved ? '#ccc' : '#2ecc71' },
-                                tipSaving && styles.buttonDisabled
-                            ]}
-                            onPress={handleSaveTip}
-                            disabled={tipSaving || tipSaved || !tipAmount}
-                        >
-                            {tipSaving ? (
-                                <ActivityIndicator size="small" color="#fff" />
-                            ) : (
-                                <Text style={styles.saveTipButtonText}>
-                                    {tipSaved ? '✓ Saved' : 'Save Tip'}
-                                </Text>
-                            )}
-                        </TouchableOpacity>
-                    </View>
-                    {tipSaved && (
-                        <Text style={styles.tipSavedNote}>Tip has been added to the ride total</Text>
-                    )}
-                </View>
-
-                {/* Payment Type Badge */}
+                {/* Payment Type Dropdown */}
                 <View style={[styles.paymentTypeSection, { backgroundColor: colors.card }]}>
                     <Text style={[styles.paymentTypeLabel, { color: colors.textSecondary }]}>Payment Method</Text>
-                    <View style={styles.paymentTypeBadge}>
-                        <Text style={styles.paymentTypeBadgeText}>
+                    <TouchableOpacity
+                        style={[styles.paymentDropdown, { backgroundColor: colors.background, borderColor: colors.divider }]}
+                        onPress={() => setShowPaymentPicker(true)}
+                    >
+                        <Text style={[styles.paymentDropdownText, { color: colors.text }]}>
                             {getPaymentDisplayName()}
                         </Text>
-                    </View>
+                        <Text style={[styles.paymentDropdownArrow, { color: colors.textSecondary }]}>▼</Text>
+                    </TouchableOpacity>
                 </View>
 
-                {/* Credit Card Form (only for Driver CC - driver enters card) */}
+                {/* Zelle Section */}
+                {isZelle && (
+                    <View style={[styles.zelleSection, { backgroundColor: colors.card }]}>
+                        <Text style={[styles.zelleSectionTitle, { color: colors.text }]}>📱 Zelle Payment Instructions</Text>
+                        <View style={styles.zelleInstructions}>
+                            <Text style={[styles.zelleStep, { color: colors.text }]}>
+                                1. Open your bank app or Zelle app
+                            </Text>
+                            <Text style={[styles.zelleStep, { color: colors.text }]}>
+                                2. Select "Send Money"
+                            </Text>
+                            <Text style={[styles.zelleStep, { color: colors.text }]}>
+                                3. Send <Text style={styles.zelleAmount}>${totalCost.toFixed(2)}</Text> to:
+                            </Text>
+                            <View style={[styles.zelleRecipient, { backgroundColor: colors.background }]}>
+                                <Text style={[styles.zelleEmail, { color: colors.primary }]}>
+                                    payments@dispatch.com
+                                </Text>
+                                <Text style={[styles.zelleNote, { color: colors.textSecondary }]}>
+                                    Include Ride #{rideId} in the memo
+                                </Text>
+                            </View>
+                            <Text style={[styles.zelleStep, { color: colors.text }]}>
+                                4. Confirm payment sent before completing ride
+                            </Text>
+                        </View>
+                    </View>
+                )}
+
+                {/* Credit Card Form (only for Driver CC - using Square SDK) */}
                 {isDriverCC && (
                     <View style={[styles.ccSection, { backgroundColor: colors.card }]}>
-                        <Text style={[styles.ccSectionTitle, { color: colors.text }]}>Card Details</Text>
-
-                        <View style={styles.inputContainer}>
-                            <Text style={[styles.inputLabel, { color: colors.textSecondary }]}>Card Number</Text>
-                            <TextInput
-                                style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.divider }]}
-                                placeholder="1234 5678 9012 3456"
-                                placeholderTextColor={colors.textMuted}
-                                value={ccNumber}
-                                onChangeText={(text) => setCcNumber(formatCCNumber(text))}
-                                keyboardType="numeric"
-                                maxLength={19}
-                            />
-                        </View>
-
-                        <View style={styles.rowInputs}>
-                            <View style={[styles.inputContainer, { flex: 1, marginRight: 10 }]}>
-                                <Text style={[styles.inputLabel, { color: colors.textSecondary }]}>Expiry</Text>
-                                <TextInput
-                                    style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.divider }]}
-                                    placeholder="MM/YY"
-                                    placeholderTextColor={colors.textMuted}
-                                    value={ccExpiry}
-                                    onChangeText={(text) => setCcExpiry(formatExpiry(text))}
-                                    keyboardType="numeric"
-                                    maxLength={5}
-                                />
+                        <Text style={[styles.ccSectionTitle, { color: colors.text }]}>💳 Secure Card Payment</Text>
+                        {console.log('Rendering Driver CC section. Square Token:', squareToken, 'Show Tokenizer:', showSquareTokenizer)}
+                        {squareToken ? (
+                            <View style={[styles.tokenInfo, { backgroundColor: colors.background }]}>
+                                <Text style={styles.tokenIcon}>✓</Text>
+                                <Text style={[styles.tokenText, { color: colors.text }]}>
+                                    Card verified and ready to charge
+                                </Text>
+                                <TouchableOpacity
+                                    style={styles.retokenizeButton}
+                                    onPress={() => {
+                                        setSquareToken(null);
+                                        setShowSquareTokenizer(true);
+                                    }}
+                                >
+                                    <Text style={[styles.retokenizeText, { color: colors.primary }]}>Use Different Card</Text>
+                                </TouchableOpacity>
                             </View>
-                            <View style={[styles.inputContainer, { flex: 1 }]}>
-                                <Text style={[styles.inputLabel, { color: colors.textSecondary }]}>CVV</Text>
-                                <TextInput
-                                    style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.divider }]}
-                                    placeholder="123"
-                                    placeholderTextColor={colors.textMuted}
-                                    value={ccCvv}
-                                    onChangeText={setCcCvv}
-                                    keyboardType="numeric"
-                                    maxLength={4}
-                                    secureTextEntry
-                                />
+                        ) : (
+                            <View style={[styles.tokenizePrompt, { backgroundColor: colors.background }]}>
+                                <Text style={styles.securityIcon}>🔒</Text>
+                                <Text style={[styles.securityText, { color: colors.text }]}>
+                                    Secure payment powered by Square
+                                </Text>
+                                <Text style={[styles.securitySubtext, { color: colors.textSecondary }]}>
+                                    Card details are encrypted and never stored
+                                </Text>
                             </View>
-                        </View>
+                        )}
+                    </View>
+                )}
 
-                        <View style={styles.inputContainer}>
-                            <Text style={[styles.inputLabel, { color: colors.textSecondary }]}>Cardholder Name</Text>
-                            <TextInput
-                                style={[styles.input, { backgroundColor: colors.background, color: colors.text, borderColor: colors.divider }]}
-                                placeholder="John Doe"
-                                placeholderTextColor={colors.textMuted}
-                                value={ccName}
-                                onChangeText={setCcName}
-                                autoCapitalize="words"
-                            />
+                {/* Dispatcher CC Info (card on file - just click charge) */}
+                {isDispatcherCC && (
+                    <View style={[styles.ccSection, { backgroundColor: colors.card }]}>
+                        <Text style={[styles.ccSectionTitle, { color: colors.text }]}>💳 Card On File</Text>
+                        <View style={[styles.cardOnFileInfo, { backgroundColor: colors.background }]}>
+                            {call?.paymentTokenId ? (
+                                <>
+                                    <Text style={styles.cardOnFileIcon}>🔒</Text>
+                                    <Text style={[styles.cardOnFileText, { color: colors.text }]}>
+                                        Credit card details are on file with dispatch.
+                                    </Text>
+                                    <Text style={[styles.cardOnFileSubtext, { color: colors.textSecondary }]}>
+                                        Simply tap "Charge" below to process the payment.
+                                    </Text>
+                                </>
+                            ) : (
+                                <>
+                                    <Text style={styles.cardOnFileIcon}>⚠️</Text>
+                                    <Text style={[styles.cardOnFileText, { color: '#e74c3c' }]}>
+                                        No card on file found for this ride.
+                                    </Text>
+                                    <Text style={[styles.cardOnFileSubtext, { color: colors.textSecondary }]}>
+                                        Please contact dispatch or change payment method.
+                                    </Text>
+                                </>
+                            )}
                         </View>
                     </View>
                 )}
@@ -411,8 +870,8 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
 
             {/* Bottom Action Button */}
             <View style={[styles.actionContainer, { backgroundColor: colors.card, borderTopColor: colors.divider }]}>
-                {isDriverCC ? (
-                    // Driver CC: Charge button (after entering card details)
+                {isCC ? (
+                    // Credit Card: Charge or Enter Card Details button
                     <TouchableOpacity
                         style={[styles.chargeButton, loading && styles.buttonDisabled]}
                         onPress={handleCharge}
@@ -422,26 +881,12 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
                             <ActivityIndicator color="#fff" />
                         ) : (
                             <Text style={styles.chargeButtonText}>
-                                Charge ${totalCost.toFixed(2)}
-                            </Text>
-                        )}
-                    </TouchableOpacity>
-                ) : isCC ? (
-                    // Other CC types (Dispatch CC, etc.): Just charge button, no input needed
-                    <TouchableOpacity
-                        style={[styles.chargeButton, loading && styles.buttonDisabled]}
-                        onPress={handleCharge}
-                        disabled={loading}
-                    >
-                        {loading ? (
-                            <ActivityIndicator color="#fff" />
-                        ) : (
-                            <Text style={styles.chargeButtonText}>
-                                Charge ${totalCost.toFixed(2)}
+                                {isDriverCC && !squareToken ? '🔒 Enter Card Details' : `Charge $${totalCost.toFixed(2)}`}
                             </Text>
                         )}
                     </TouchableOpacity>
                 ) : (
+                    // Cash or Zelle: Complete Ride button
                     <TouchableOpacity
                         style={[styles.completeButton, loading && styles.buttonDisabled]}
                         onPress={handleCompleteRide}
@@ -450,11 +895,100 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
                         {loading ? (
                             <ActivityIndicator color="#fff" />
                         ) : (
-                            <Text style={styles.completeButtonText}>Complete Ride</Text>
+                            <Text style={styles.completeButtonText}>
+                                {isZelle ? 'Confirm Zelle & Complete' : 'Complete Ride'}
+                            </Text>
                         )}
                     </TouchableOpacity>
                 )}
             </View>
+
+            {/* Payment Method Picker Modal */}
+            <Modal
+                visible={showPaymentPicker}
+                transparent={true}
+                animationType="slide"
+            >
+                <TouchableOpacity
+                    style={styles.pickerModalOverlay}
+                    activeOpacity={1}
+                    onPress={() => setShowPaymentPicker(false)}
+                >
+                    <View style={[styles.pickerModal, { backgroundColor: colors.card }]}>
+                        <View style={styles.pickerHeader}>
+                            <Text style={[styles.pickerTitle, { color: colors.text }]}>Select Payment Method</Text>
+                            <TouchableOpacity onPress={() => setShowPaymentPicker(false)}>
+                                <Text style={[styles.pickerDone, { color: colors.primary }]}>✕</Text>
+                            </TouchableOpacity>
+                        </View>
+                        <View style={styles.paymentOptionsList}>
+                            {PAYMENT_OPTIONS.map((option) => (
+                                <TouchableOpacity
+                                    key={option.value}
+                                    style={[
+                                        styles.paymentOptionItem,
+                                        { borderBottomColor: colors.divider },
+                                        selectedPaymentMethod === option.value && styles.paymentOptionItemSelected
+                                    ]}
+                                    onPress={() => {
+                                        setSelectedPaymentMethod(option.value);
+                                        setShowPaymentPicker(false);
+                                    }}
+                                >
+                                    <Text style={[
+                                        styles.paymentOptionText,
+                                        { color: colors.text },
+                                        selectedPaymentMethod === option.value && styles.paymentOptionTextSelected
+                                    ]}>
+                                        {option.label}
+                                    </Text>
+                                    {selectedPaymentMethod === option.value && (
+                                        <Text style={styles.paymentOptionCheck}>✓</Text>
+                                    )}
+                                </TouchableOpacity>
+                            ))}
+                        </View>
+                    </View>
+                </TouchableOpacity>
+            </Modal>
+
+            {/* Square Tokenizer - renders its own modal */}
+            {showSquareTokenizer && (
+                <SquareCardTokenizer
+                    rideId={rideId}
+                    amount={totalCost}
+                    onTokenReceived={(token, details) => {
+                        console.log('✅ Token received:', token);
+                        setSquareToken(token);
+                        setShowSquareTokenizer(false);
+                        setTokenizing(false);
+                        showToast('Card verified successfully!', 'success');
+                    }}
+                    onError={(message, code) => {
+                        //console.error('❌ Tokenization error:', message, code);
+                        setShowSquareTokenizer(false);
+                        setTokenizing(false);
+
+                        if (code === 'USER_CANCELED') {
+                            // User canceled, no alert needed
+                            return;
+                        }
+
+                        let alertMessage = message;
+                        let alertButtons = [{ text: 'OK' }];
+
+                        if (code === 'INVALID_CARD' || code === 'CVV_FAILURE' || code === 'CARD_EXPIRED') {
+                            alertMessage = 'Invalid card details. Please check the card number, expiry date, and CVV.';
+                            alertButtons = [
+                                { text: 'Retry', onPress: () => setShowSquareTokenizer(true) },
+                                { text: 'Cancel' }
+                            ];
+                        }
+
+                        showAlert('Card Verification Failed', alertMessage, alertButtons);
+                    }}
+                />
+            )}
 
             {/* Payment Success Modal */}
             <Modal
@@ -534,23 +1068,119 @@ const styles = StyleSheet.create({
         borderRadius: 12,
         padding: 15,
         marginBottom: 20,
-        alignItems: 'center',
     },
     paymentTypeLabel: {
         fontSize: 14,
         color: '#666',
         marginBottom: 8,
     },
-    paymentTypeBadge: {
-        backgroundColor: '#e8f4fd',
-        paddingHorizontal: 20,
-        paddingVertical: 10,
-        borderRadius: 20,
+    paymentDropdown: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        borderWidth: 1,
+        borderRadius: 8,
+        paddingHorizontal: 15,
+        paddingVertical: 12,
     },
-    paymentTypeBadgeText: {
+    paymentDropdownText: {
         fontSize: 16,
         fontWeight: '600',
+    },
+    paymentDropdownArrow: {
+        fontSize: 12,
+    },
+    // Zelle section styles
+    zelleSection: {
+        backgroundColor: '#fff',
+        borderRadius: 12,
+        padding: 20,
+        marginBottom: 20,
+    },
+    zelleSectionTitle: {
+        fontSize: 16,
+        fontWeight: '600',
+        marginBottom: 15,
+    },
+    zelleInstructions: {
+        gap: 12,
+    },
+    zelleStep: {
+        fontSize: 15,
+        lineHeight: 22,
+    },
+    zelleAmount: {
+        fontWeight: '700',
+        color: '#6b2fba',
+        fontSize: 16,
+    },
+    zelleRecipient: {
+        padding: 15,
+        borderRadius: 8,
+        marginVertical: 8,
+        alignItems: 'center',
+    },
+    zelleEmail: {
+        fontSize: 18,
+        fontWeight: '700',
+        marginBottom: 5,
+    },
+    zelleNote: {
+        fontSize: 13,
+        fontStyle: 'italic',
+    },
+    // Picker modal styles
+    pickerModalOverlay: {
+        flex: 1,
+        justifyContent: 'flex-end',
+        backgroundColor: 'rgba(0,0,0,0.5)',
+    },
+    pickerModal: {
+        borderTopLeftRadius: 20,
+        borderTopRightRadius: 20,
+        paddingBottom: 30,
+    },
+    pickerHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: 15,
+        borderBottomWidth: 1,
+        borderBottomColor: '#e0e0e0',
+    },
+    pickerTitle: {
+        fontSize: 18,
+        fontWeight: '600',
+    },
+    pickerDone: {
+        fontSize: 20,
+        fontWeight: '600',
+    },
+    paymentOptionsList: {
+        paddingVertical: 10,
+    },
+    paymentOptionItem: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingVertical: 16,
+        paddingHorizontal: 20,
+        borderBottomWidth: 1,
+    },
+    paymentOptionItemSelected: {
+        backgroundColor: 'rgba(0, 122, 255, 0.1)',
+    },
+    paymentOptionText: {
+        fontSize: 17,
+    },
+    paymentOptionTextSelected: {
+        fontWeight: '600',
         color: '#007AFF',
+    },
+    paymentOptionCheck: {
+        fontSize: 18,
+        color: '#007AFF',
+        fontWeight: '700',
     },
     ccSection: {
         backgroundColor: '#fff',
@@ -563,6 +1193,26 @@ const styles = StyleSheet.create({
         fontWeight: '600',
         color: '#333',
         marginBottom: 15,
+    },
+    // Card on file styles (for Dispatcher CC)
+    cardOnFileInfo: {
+        padding: 20,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    cardOnFileIcon: {
+        fontSize: 40,
+        marginBottom: 10,
+    },
+    cardOnFileText: {
+        fontSize: 16,
+        fontWeight: '500',
+        textAlign: 'center',
+        marginBottom: 8,
+    },
+    cardOnFileSubtext: {
+        fontSize: 14,
+        textAlign: 'center',
     },
     inputContainer: {
         marginBottom: 15,
@@ -776,8 +1426,9 @@ const styles = StyleSheet.create({
     priceBreakdown: {
         backgroundColor: '#fff',
         borderRadius: 12,
-        padding: 15,
-        marginBottom: 20,
+        paddingHorizontal: 16,
+        paddingVertical: 8,
+        marginTop: 15,
     },
     breakdownTitle: {
         fontSize: 14,
@@ -789,18 +1440,21 @@ const styles = StyleSheet.create({
     breakdownRow: {
         flexDirection: 'row',
         justifyContent: 'space-between',
-        paddingVertical: 8,
+        alignItems: 'center',
+        paddingVertical: 12,
         borderBottomWidth: 1,
         borderBottomColor: '#f0f0f0',
+        minHeight: 44,
     },
     breakdownLabel: {
         fontSize: 14,
         color: '#666',
+        flex: 1,
     },
     breakdownValue: {
         fontSize: 14,
         color: '#333',
-        fontWeight: '500',
+        fontWeight: '600',
     },
     breakdownTotal: {
         marginTop: 5,
@@ -815,6 +1469,144 @@ const styles = StyleSheet.create({
         fontSize: 16,
         fontWeight: '700',
         color: '#2ecc71',
+    },
+    // Editable field styles
+    editableFieldRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'flex-end',
+        gap: 8,
+    },
+    editableInput: {
+        width: 65,
+        paddingHorizontal: 10,
+        paddingVertical: 6,
+        borderWidth: 2,
+        borderRadius: 8,
+        fontSize: 15,
+        fontWeight: '600',
+        textAlign: 'center',
+    },
+    editableUnit: {
+        fontSize: 13,
+        fontWeight: '500',
+    },
+    editableDollar: {
+        fontSize: 15,
+        fontWeight: '600',
+    },
+    editButton: {
+        marginLeft: 10,
+        padding: 6,
+        backgroundColor: 'rgba(0,0,0,0.05)',
+        borderRadius: 6,
+    },
+    editButtonText: {
+        fontSize: 16,
+    },
+    confirmButton: {
+        backgroundColor: '#f39c12',
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    confirmButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    cancelEditButton: {
+        backgroundColor: '#e74c3c',
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    cancelEditButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    // Square tokenizer styles
+    tokenInfo: {
+        padding: 20,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    tokenIcon: {
+        fontSize: 40,
+        marginBottom: 10,
+        color: '#2ecc71',
+    },
+    tokenText: {
+        fontSize: 16,
+        fontWeight: '500',
+        textAlign: 'center',
+        marginBottom: 15,
+    },
+    retokenizeButton: {
+        padding: 10,
+    },
+    retokenizeText: {
+        fontSize: 14,
+        fontWeight: '600',
+    },
+    tokenizePrompt: {
+        padding: 20,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    securityIcon: {
+        fontSize: 40,
+        marginBottom: 10,
+    },
+    securityText: {
+        fontSize: 16,
+        fontWeight: '500',
+        textAlign: 'center',
+        marginBottom: 8,
+    },
+    securitySubtext: {
+        fontSize: 13,
+        textAlign: 'center',
+    },
+    tokenizerModalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        justifyContent: 'center',
+        padding: 20,
+    },
+    tokenizerModal: {
+        borderRadius: 20,
+        maxHeight: '80%',
+    },
+    tokenizerHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: 20,
+        borderBottomWidth: 1,
+        borderBottomColor: '#e0e0e0',
+    },
+    tokenizerTitle: {
+        fontSize: 20,
+        fontWeight: '600',
+    },
+    tokenizerClose: {
+        fontSize: 24,
+        fontWeight: '600',
+    },
+    tokenizingContainer: {
+        padding: 60,
+        alignItems: 'center',
+    },
+    tokenizingText: {
+        marginTop: 20,
+        fontSize: 16,
+        fontWeight: '500',
     },
 });
 

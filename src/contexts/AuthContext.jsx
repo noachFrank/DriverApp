@@ -2,7 +2,9 @@ import React, { createContext, useContext, useState, useEffect, useRef } from 'r
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native';
 import signalRService from '../services/signalRService';
-import { authAPI } from '../services/apiService';
+import pushNotificationService from '../services/pushNotificationService';
+import { authAPI, pushNotificationAPI } from '../services/apiService';
+import { tokenManager, setForceLogoutCallback } from '../config/apiConfig';
 
 const AuthContext = createContext();
 
@@ -19,6 +21,25 @@ export const AuthProvider = ({ children }) => {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
     const appStateRef = useRef(AppState.currentState);
+
+    // Define forceLogout function
+    const forceLogout = async () => {
+        console.log('🔴 Force logout triggered (token invalid/expired)');
+        pushNotificationService.cleanup();
+        await stopSignalR();
+        await AsyncStorage.removeItem('driverAuth');
+        await tokenManager.removeToken();
+        setIsAuthenticated(false);
+        setUser(null);
+    };
+
+    // Register forceLogout with API config on mount
+    useEffect(() => {
+        setForceLogoutCallback(forceLogout);
+        return () => {
+            setForceLogoutCallback(null);
+        };
+    }, []);
 
     useEffect(() => {
         checkExistingAuth();
@@ -64,13 +85,34 @@ export const AuthProvider = ({ children }) => {
                 const authData = JSON.parse(savedAuth);
                 console.log('Found existing auth:', authData.user?.userId);
 
+                // CRITICAL: Validate JWT token exists
+                if (!authData.user?.token) {
+                    console.error('⚠️ Auth data exists but JWT token is missing - logging out');
+                    // Clear invalid auth state
+                    await AsyncStorage.removeItem('driverAuth');
+                    await tokenManager.removeToken();
+                    setLoading(false);
+                    return;
+                }
+
+                // Restore JWT token for API requests
+                await tokenManager.setToken(authData.user.token);
+                console.log('JWT token restored for API requests');
+
                 setIsAuthenticated(true);
                 setUser(authData.user);
 
+                // Reinitialize real-time services
                 await initializeSignalR(authData.user.userId);
+
+                // Reinitialize push notifications (token might have changed)
+                initializePushNotifications(authData.user.userId);
             }
         } catch (error) {
             console.error('Error checking existing auth:', error);
+            // Clear auth state on error
+            await AsyncStorage.removeItem('driverAuth');
+            await tokenManager.removeToken();
         } finally {
             setLoading(false);
         }
@@ -83,6 +125,39 @@ export const AuthProvider = ({ children }) => {
         } catch (error) {
             console.warn('⚠️ SignalR initialization failed:', error.message);
             console.log('App will work in HTTP polling mode');
+        }
+    };
+
+    /**
+     * Initialize push notifications for a driver.
+     * 
+     * This does three things:
+     * 1. Requests permission to send push notifications
+     * 2. Gets the unique Expo Push Token for this device
+     * 3. Sends the token to our server to store with the driver's ID
+     * 
+     * The server uses this token to send push notifications when:
+     * - A new call comes in
+     * - A call is canceled or reassigned
+     * - A dispatcher sends a message
+     */
+    const initializePushNotifications = async (driverId) => {
+        try {
+            console.log('🔔 Initializing push notifications for driver:', driverId);
+
+            // Get the Expo Push Token
+            const pushToken = await pushNotificationService.initialize();
+
+            if (pushToken) {
+                // Send token to server
+                await pushNotificationAPI.registerToken(driverId, pushToken);
+                console.log('✅ Push token registered with server');
+            } else {
+                console.log('⚠️ No push token available (permissions denied or not a real device)');
+            }
+        } catch (error) {
+            // Don't fail login if push notifications fail - they're optional
+            console.warn('⚠️ Push notification setup failed:', error.message);
         }
     };
 
@@ -102,31 +177,48 @@ export const AuthProvider = ({ children }) => {
 
         try {
             const data = await authAPI.login('driver', username, password);
+            console.log('Login API response:', data);
+            // Handle both new JWT response format (UserId, UserDetails) and legacy format (id)
+            const userId = data.userId || data.UserId || data.id;
+            const userDetails = data.userDetails || data.UserDetails || data;
 
-            // API returns 'id' not 'userId'
-            if (!data || !data.id) {
+            if (!userId) {
                 return { success: false, message: 'Invalid credentials' };
             }
 
             const userData = {
-                username: data.userName || username,
+                username: userDetails.userName || username,
                 role: 'driver',
-                userId: data.id,
-                name: data.name,
-                email: data.email,
-                token: data.token,
-                joinedDate: data.joinedDate,
-                license: data.license,
-                phoneNumber: data.phoneNumber,
-                carCount: data.cars?.length || 0
+                userId: userId,
+                name: userDetails.name || data.name,
+                email: userDetails.email,
+                token: data.token || data.Token,
+                joinedDate: userDetails.joinedDate,
+                license: userDetails.license,
+                phoneNumber: userDetails.phoneNumber,
+                carCount: userDetails.cars?.length || 0
             };
 
             setIsAuthenticated(true);
             setUser(userData);
 
+            // Store auth data
             await AsyncStorage.setItem('driverAuth', JSON.stringify({ user: userData }));
 
+            // CRITICAL: Store JWT token separately for API requests
+            if (userData.token) {
+                await tokenManager.setToken(userData.token);
+                console.log('JWT token stored for API requests:', userData.token.substring(0, 20) + '...');
+            } else {
+                console.error('⚠️ No token in login response!');
+            }
+
+            // Initialize real-time services (token must be set first!)
+            console.log('Initializing SignalR with userId:', userData.userId);
             await initializeSignalR(userData.userId);
+
+            // Initialize push notifications (non-blocking - don't fail login if this fails)
+            initializePushNotifications(userData.userId);
 
             return { success: true, userId: userData.userId };
         } catch (error) {
@@ -138,6 +230,14 @@ export const AuthProvider = ({ children }) => {
     const logout = async () => {
         try {
             if (user?.userId) {
+                // Unregister push token first (so we don't receive notifications after logout)
+                try {
+                    await pushNotificationAPI.unregisterToken(user.userId);
+                    console.log('Push token unregistered');
+                } catch (pushError) {
+                    console.warn('Failed to unregister push token:', pushError);
+                }
+
                 try {
                     await authAPI.logout('driver', user.userId);
                 } catch (apiError) {
@@ -145,9 +245,16 @@ export const AuthProvider = ({ children }) => {
                 }
             }
 
+            // Clean up push notification listeners
+            pushNotificationService.cleanup();
+
             await stopSignalR();
 
             await AsyncStorage.removeItem('driverAuth');
+            // CRITICAL: Remove JWT token
+            await tokenManager.removeToken();
+            console.log('JWT token removed');
+
             setIsAuthenticated(false);
             setUser(null);
 
@@ -155,8 +262,12 @@ export const AuthProvider = ({ children }) => {
         } catch (error) {
             console.error('Logout error:', error);
 
+            // Ensure cleanup even on error
+            pushNotificationService.cleanup();
             await stopSignalR();
             await AsyncStorage.removeItem('driverAuth');
+            // CRITICAL: Remove JWT token even on error
+            await tokenManager.removeToken();
             setIsAuthenticated(false);
             setUser(null);
 
@@ -170,7 +281,8 @@ export const AuthProvider = ({ children }) => {
         loading,
         login,
         logout,
-        signalRService
+        signalRService,
+        forceLogout // Use the function defined above
     };
 
     return (

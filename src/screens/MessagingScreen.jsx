@@ -35,24 +35,55 @@ import {
     KeyboardAvoidingView,
     Platform,
     ActivityIndicator,
-    Alert
+    Keyboard
 } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAlert } from '../contexts/AlertContext';
 import { communicationAPI } from '../services/apiService';
 import signalRService from '../services/signalRService';
+import { formatTime } from '../utils/dateHelpers';
 
 const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, showBackButton }) => {
     const { user } = useAuth();
     const { theme } = useTheme();
     const colors = theme.colors;
+    const { showAlert } = useAlert();
     const [messages, setMessages] = useState([]);
     const [newMessage, setNewMessage] = useState(initialMessage);
     const [loading, setLoading] = useState(true);
     const [sending, setSending] = useState(false);
     const [firstUnreadIndex, setFirstUnreadIndex] = useState(-1); // Index of first unread message
+    const [keyboardHeight, setKeyboardHeight] = useState(0);
     const flatListRef = useRef(null);
     const hasInitiallyScrolled = useRef(false);
+
+    // Handle keyboard events for Android
+    useEffect(() => {
+        const keyboardDidShowListener = Keyboard.addListener(
+            Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+            (e) => {
+                if (Platform.OS === 'android') {
+                    console.log('Keyboard shown, height:', e.endCoordinates.height);
+                    setKeyboardHeight(e.endCoordinates.height - 75);
+                }
+            }
+        );
+        const keyboardDidHideListener = Keyboard.addListener(
+            Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+            () => {
+                if (Platform.OS === 'android') {
+                    setKeyboardHeight(0);
+                }
+            }
+        );
+
+        return () => {
+            keyboardDidShowListener.remove();
+            keyboardDidHideListener.remove();
+        };
+    }, []);
 
     // Fetch today's messages on mount
     useEffect(() => {
@@ -63,7 +94,7 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
 
     // Set up SignalR listener for incoming messages
     useEffect(() => {
-        const unsubscribe = signalRService.onMessageReceived((messageData) => {
+        const unsubscribe = signalRService.onMessageReceived(async (messageData) => {
             console.log('New message received:', messageData);
 
             // Handle both camelCase and PascalCase from server
@@ -83,12 +114,51 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
             setTimeout(() => {
                 flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
             }, 100);
+
+            // Mark message as read immediately since messaging screen is open
+            // Only mark dispatcher/broadcast messages as read (not our own messages)
+            const from = (messageData.from || messageData.From || '').toLowerCase();
+            if (!from.startsWith('driver') && messageData.id) {
+                try {
+                    await signalRService.markMessagesAsRead([messageData.id]);
+                    console.log('Marked incoming message as read via SignalR:', messageData.id);
+                    // Notify parent that this message was read (don't add to unread count)
+                    onUnreadCountChange?.(0);
+                } catch (error) {
+                    console.error('Error marking incoming message as read via SignalR:', error);
+                }
+            }
         });
 
         return () => {
             unsubscribe();
         };
     }, [user]);
+
+    // Listen for read receipts - when dispatcher marks our messages as read
+    useEffect(() => {
+        const unsubscribe = signalRService.onMessageMarkedAsRead((data) => {
+            console.log('📬 Dispatcher marked message as read:', data);
+            console.log('Looking for message ID:', data.messageId);
+
+            // Update the message in our local state to mark it as read
+            setMessages(prev => {
+                const updated = prev.map(msg => {
+                    if (msg.id === data.messageId || msg.Id === data.messageId) {
+                        console.log('✅ Found message to mark as read:', msg.id, msg.message);
+                        return { ...msg, read: true, Read: true };
+                    }
+                    return msg;
+                });
+                console.log('Updated messages array:', updated.filter(m => m.from?.toLowerCase().startsWith('driver')).map(m => ({ id: m.id, read: m.read })));
+                return updated;
+            });
+        });
+
+        return () => {
+            unsubscribe();
+        };
+    }, []);
 
     // Prefill input if initialMessage changes (e.g., when coming from ride)
     useEffect(() => {
@@ -146,16 +216,16 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
                 .filter(msg => !isMessageRead(msg) && !getMessageFrom(msg).startsWith('driver'))
                 .map(msg => msg.id || msg.Id);
 
-            // Mark unread messages as read after a short delay (so user sees them as unread first)
+            // Mark unread messages as read via SignalR after a short delay (so user sees them as unread first)
             if (unreadIds.length > 0) {
                 setTimeout(async () => {
                     try {
-                        await communicationAPI.markAsRead(unreadIds);
-                        console.log('Marked messages as read:', unreadIds);
+                        await signalRService.markMessagesAsRead(unreadIds);
+                        console.log('Marked messages as read via SignalR:', unreadIds);
                         // Notify parent that unread count changed
                         onUnreadCountChange?.(0);
                     } catch (error) {
-                        console.error('Error marking messages as read:', error);
+                        console.error('Error marking messages as read via SignalR:', error);
                     }
                 }, 1000); // Wait 1 second so user can see unread indicator
             } else {
@@ -166,7 +236,7 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
             console.error('Error fetching messages:', error);
             // Don't show error for 204 No Content (empty messages)
             if (error.response?.status !== 204) {
-                Alert.alert('Error', 'Failed to load messages. Please try again.');
+                showAlert('Error', 'Failed to load messages. Please try again.', [{ text: 'OK' }]);
             }
             setMessages([]);
             setFirstUnreadIndex(-1);
@@ -188,15 +258,47 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
         setSending(true);
 
         try {
+            // Before sending, mark any unread dispatcher messages as read
+            // (If driver is replying, they obviously saw the messages)
+            const unreadDispatcherMessages = messages.filter(msg => {
+                const from = (msg.from || msg.From || '').toLowerCase();
+                const isRead = msg.read === true || msg.Read === true;
+                return !from.startsWith('driver') && !isRead;
+            });
+
+            if (unreadDispatcherMessages.length > 0) {
+                const unreadIds = unreadDispatcherMessages
+                    .map(msg => msg.id || msg.Id)
+                    .filter(id => id && typeof id === 'number');
+
+                if (unreadIds.length > 0) {
+                    try {
+                        await signalRService.markMessagesAsRead(unreadIds);
+                        console.log('Marked unread dispatcher messages as read before sending:', unreadIds);
+                        // Update local state
+                        setMessages(prev => prev.map(msg =>
+                            unreadIds.includes(msg.id || msg.Id)
+                                ? { ...msg, read: true, Read: true }
+                                : msg
+                        ));
+                    } catch (error) {
+                        console.error('Error marking unread messages as read:', error);
+                        // Continue sending even if marking fails
+                    }
+                }
+            }
+
             // Send via SignalR - this will:
             // 1. Save to database on server
             // 2. Notify all connected dispatchers
-            await signalRService.sendMessageToDispatchers(messageText);
+            // 3. Return the saved Communication object with database-assigned ID
+            const savedMessage = await signalRService.sendMessageToDispatchers(messageText, null, user?.name);
+            console.log('✅ Message saved with ID:', savedMessage?.id || savedMessage?.Id);
 
-            // Add the message to our local list immediately (optimistic update)
+            // Add the message to our local list with the real database ID
             // Add to beginning for inverted list (newest at index 0)
             const sentMessage = {
-                id: Date.now(), // Temporary ID until we refresh
+                id: savedMessage?.id || savedMessage?.Id || Date.now(), // Use database ID
                 message: messageText,
                 driverId: user?.userId,
                 from: `Driver-${user?.userId}`,
@@ -214,7 +316,7 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
             console.log('Message sent successfully');
         } catch (error) {
             console.error('Error sending message:', error);
-            Alert.alert('Error', 'Failed to send message. Please try again.');
+            showAlert('Error', 'Failed to send message. Please try again.', [{ text: 'OK' }]);
             // Restore the message in the input if sending failed
             setNewMessage(messageText);
         } finally {
@@ -228,18 +330,6 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
     const isDriverMessage = (msg) => {
         const from = msg.from || msg.From || '';
         return from.toLowerCase().startsWith('driver');
-    };
-
-    /**
-     * Format the timestamp for display
-     */
-    const formatTime = (dateString) => {
-        try {
-            const date = new Date(dateString);
-            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        } catch {
-            return '';
-        }
     };
 
     /**
@@ -265,10 +355,21 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
     const renderUnreadDivider = () => (
         <View style={styles.unreadDividerContainer}>
             <View style={[styles.unreadDividerLine, { backgroundColor: colors.error }]} />
-            <Text style={[styles.unreadDividerText, { color: colors.error }]}>unread</Text>
+            <Text style={[styles.unreadDividerText, { color: colors.error, textTransform: 'uppercase', fontWeight: 'bold' }]}>Unread</Text>
             <View style={[styles.unreadDividerLine, { backgroundColor: colors.error }]} />
         </View>
     );
+
+    /**
+     * Copy message text to clipboard
+     */
+    const copyMessageToClipboard = async (messageText) => {
+        try {
+            await Clipboard.setStringAsync(messageText);
+        } catch (error) {
+            console.error('Error copying to clipboard:', error);
+        }
+    };
 
     /**
      * Render a single message bubble
@@ -282,6 +383,7 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
         // In inverted list, show divider at index ABOVE the last unread (firstUnreadIndex + 1)
         // This makes the divider appear visually between read and unread messages
         const showUnreadDivider = firstUnreadIndex >= 0 && index === firstUnreadIndex;
+        const messageText = item.message || item.Message;
 
         return (
             <View>
@@ -306,21 +408,29 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
                         </View>
                     )}
 
-                    {/* Message bubble */}
-                    <View style={[
-                        styles.messageBubble,
-                        isDriver ? styles.driverBubble : [styles.dispatcherBubble, { backgroundColor: colors.card }],
-                        isBroadcast && styles.broadcastBubble,
-                        isUnread && styles.unreadBubble
-                    ]}>
-                        <Text style={[
-                            styles.messageText,
-                            isDriver ? styles.driverMessageText : [styles.dispatcherMessageText, { color: colors.text }],
-                            isBroadcast && { color: '#333' }
+                    {/* Message bubble - long press to copy */}
+                    <TouchableOpacity
+                        onLongPress={() => copyMessageToClipboard(messageText)}
+                        delayLongPress={500}
+                        activeOpacity={0.7}
+                    >
+                        <View style={[
+                            styles.messageBubble,
+                            isDriver ? styles.driverBubble : [styles.dispatcherBubble, { backgroundColor: colors.card }],
+                            isBroadcast && styles.broadcastBubble,
+                            isUnread && styles.unreadBubble
                         ]}>
-                            {item.message || item.Message}
-                        </Text>
-                    </View>
+                            <Text style={[
+                                styles.messageText,
+                                isDriver ? styles.driverMessageText : [styles.dispatcherMessageText, { color: colors.text }],
+                                isBroadcast && { color: '#333' }
+                            ]}
+                                selectable={true}
+                            >
+                                {messageText}
+                            </Text>
+                        </View>
+                    </TouchableOpacity>
 
                     {/* Timestamp and read status for driver messages */}
                     <View style={[
@@ -371,8 +481,8 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
     return (
         <KeyboardAvoidingView
             style={[styles.container, { backgroundColor: colors.background }]}
-            behavior="padding"
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 70}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
         >
             {/* Back Button - Only shown when opened from CurrentCallScreen */}
             {showBackButton && onBack && (
@@ -390,6 +500,7 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
                 keyExtractor={(item, index) => (item.id || item.Id || index).toString()}
                 renderItem={renderMessage}
                 inverted={true}
+                extraData={messages}
                 contentContainerStyle={[
                     styles.messagesList,
                     messages.length === 0 && styles.emptyList
@@ -418,7 +529,14 @@ const MessagingScreen = ({ onUnreadCountChange, initialMessage = '', onBack, sho
             />
 
             {/* Message Input Area */}
-            <View style={[styles.inputContainer, { backgroundColor: colors.card, borderTopColor: colors.divider }]}>
+            <View style={[
+                styles.inputContainer,
+                {
+                    backgroundColor: colors.card,
+                    borderTopColor: colors.divider,
+                    marginBottom: Platform.OS === 'android' ? keyboardHeight : 0
+                }
+            ]}>
                 <TextInput
                     style={[styles.textInput, { backgroundColor: colors.background, color: colors.text }]}
                     value={newMessage}
@@ -599,7 +717,7 @@ const styles = StyleSheet.create({
     inputContainer: {
         flexDirection: 'row',
         padding: 10,
-        paddingBottom: Platform.OS === 'ios' ? 25 : 10,
+        paddingBottom: Platform.OS === 'ios' ? 30 : 15,
         backgroundColor: '#fff',
         borderTopWidth: 1,
         borderTopColor: '#e0e0e0',

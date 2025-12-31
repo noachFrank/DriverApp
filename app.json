@@ -1,8 +1,14 @@
 {
   "expo": {
-    "name": "DriverApp",
-    "slug": "DriverApp",
+    "name": "Shia's Transportation",
+    "slug": "driver-app",
+    "owner": "shias-transportation",
     "version": "1.0.0",
+    "extra": {
+      "eas": {
+        "projectId": "e10cef00-7d76-4b2e-8b18-7a7414e504b1"
+      }
+    },
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,7 +21,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.shiasTransportation.driverapp",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "We need your location to show distance to pickup locations."
+        "NSLocationWhenInUseUsageDescription": "We need your location to show distance to pickup locations.",
+        "UIBackgroundModes": ["remote-notification"]
       }
     },
     "android": {
@@ -26,8 +33,11 @@
       "package": "com.shiasTransportation.driverapp",
       "permissions": [
         "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION"
-      ]
+        "ACCESS_FINE_LOCATION",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
+      ],
+      "googleServicesFile": "./google-services.json"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -38,7 +48,16 @@
         {
           "locationWhenInUsePermission": "Allow DriverApp to use your location to show distance to pickup locations."
         }
-      ]
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#1976d2",
+          "sounds": []
+        }
+      ],
+      "./plugins/withSquareInAppPayments"
     ]
   }
 }

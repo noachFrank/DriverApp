@@ -23,24 +23,37 @@ import {
     TouchableOpacity,
     StyleSheet,
     RefreshControl,
-    ActivityIndicator,
-    Alert
+    ActivityIndicator
 } from 'react-native';
 import * as Location from 'expo-location';
-import { ridesAPI } from '../services/apiService';
+import { ridesAPI, carsAPI } from '../services/apiService';
 import signalRService from '../services/signalRService';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
-import { formatDayLabel, formatTime, formatEstimatedDuration } from '../utils/dateHelpers';
+import { useAlert } from '../contexts/AlertContext';
+import { formatDayLabel, formatTime, formatEstimatedDuration, formatTimeOnly, formatDate } from '../utils/dateHelpers';
 import { calculateDistanceToPickup } from '../services/distanceService';
 
-const OpenCallsScreen = () => {
+/**
+ * OpenCallsScreen - Displays available calls for the driver
+ * 
+ * Props:
+ * @param {number} scrollToRideId - Optional. If set, scroll to this ride and highlight it
+ * @param {function} onScrollComplete - Optional. Called after scrolling is complete
+ * @param {function} onNavigateToCars - Optional. Callback to navigate to car management
+ */
+const OpenCallsScreen = ({ scrollToRideId, onScrollComplete, onNavigateToCars }) => {
     const { theme } = useTheme();
     const { user } = useAuth();
+    const { showAlert, showToast } = useAlert();
     const colors = theme.colors;
     const [calls, setCalls] = useState([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
+
+    // Car status - to check if driver has a primary car
+    const [hasPrimaryCar, setHasPrimaryCar] = useState(true); // Assume true until checked
+    const [carsLoading, setCarsLoading] = useState(true);
 
     // Distance tracking state
     const [userLocation, setUserLocation] = useState(null);
@@ -48,6 +61,12 @@ const OpenCallsScreen = () => {
     const [locationPermission, setLocationPermission] = useState(null);
 
     const [assigningCallId, setAssigningCallId] = useState(null); // Track which call is being assigned
+
+    // Highlighted call state (for push notification scroll-to)
+    const [highlightedRideId, setHighlightedRideId] = useState(null);
+
+    // Ref for the FlatList to enable scrolling
+    const flatListRef = useRef(null);
 
     // Use refs to avoid stale closure issues with SignalR callbacks
     const assigningCallIdRef = useRef(null);
@@ -78,6 +97,36 @@ const OpenCallsScreen = () => {
         })();
     }, []);
 
+    // Check if driver has cars with a primary car set
+    useEffect(() => {
+        const checkDriverCars = async () => {
+            try {
+                const driverId = user?.userId || signalRService.getDriverId();
+                if (!driverId) {
+                    setCarsLoading(false);
+                    setHasPrimaryCar(false);
+                    return;
+                }
+
+                const response = await carsAPI.getByDriver(driverId);
+                // API returns 204 (No Content) when no cars, so response may be undefined/empty
+                const cars = Array.isArray(response) ? response : [];
+                const primaryCar = cars.find(car => car.isPrimary);
+                console.log('Driver cars fetched:', cars);
+                setHasPrimaryCar(!!primaryCar);
+                console.log('Driver cars check:', { totalCars: cars.length, hasPrimary: !!primaryCar });
+            } catch (error) {
+                console.error('Error checking driver cars:', error);
+                // On error, assume they have cars to avoid blocking
+                setHasPrimaryCar(true);
+            } finally {
+                setCarsLoading(false);
+            }
+        };
+
+        checkDriverCars();
+    }, [user?.userId]);
+
     // Calculate distance to pickup for a specific call (on-demand)
     const calculateDistance = async (rideId, pickupAddress) => {
         // Get current location or request it
@@ -86,7 +135,7 @@ const OpenCallsScreen = () => {
         if (!location) {
             const { status } = await Location.requestForegroundPermissionsAsync();
             if (status !== 'granted') {
-                Alert.alert('Location Required', 'Please enable location to see distance to pickup.');
+                showAlert('Location Required', 'Please enable location to see distance to pickup.', [{ text: 'OK' }]);
                 return;
             }
             const currentLocation = await Location.getCurrentPositionAsync({});
@@ -133,8 +182,11 @@ const OpenCallsScreen = () => {
                 return;
             }
             const data = await ridesAPI.getOpen(driverId);
-            console.log('Open calls fetched:', data);
-            setCalls(Array.isArray(data) ? data : []);
+            //console.log('Open calls fetched:', data);
+            const sortedData = Array.isArray(data)
+                ? data.sort((a, b) => new Date(a.scheduledFor) - new Date(b.scheduledFor))
+                : [];
+            setCalls(sortedData);
         } catch (error) {
             console.error('Error fetching open calls:', error);
             setCalls([]);
@@ -144,19 +196,72 @@ const OpenCallsScreen = () => {
         }
     };
 
-    // Initial fetch and SignalR setup
+    // Handle scroll-to-ride from push notification
+    // When scrollToRideId is set, find the ride and scroll to it
+    useEffect(() => {
+        if (scrollToRideId && calls.length > 0 && flatListRef.current) {
+            // Find the index of the ride to scroll to
+            const rideIndex = calls.findIndex(call => call.rideId === scrollToRideId);
+
+            if (rideIndex !== -1) {
+                console.log(`📱 Scrolling to ride ${scrollToRideId} at index ${rideIndex}`);
+
+                // Scroll to the item with a small delay to ensure list is rendered
+                setTimeout(() => {
+                    flatListRef.current?.scrollToIndex({
+                        index: rideIndex,
+                        animated: true,
+                        viewPosition: 0.3 // Position near top but not at very top
+                    });
+
+                    // Highlight the item briefly
+                    setHighlightedRideId(scrollToRideId);
+
+                    // Remove highlight after 3 seconds
+                    setTimeout(() => {
+                        setHighlightedRideId(null);
+                    }, 3000);
+                }, 300);
+            } else {
+                console.log(`📱 Ride ${scrollToRideId} not found in list - may have been taken`);
+                showToast('This call may have already been taken by another driver.', 'warning');
+            }
+
+            // Notify parent that scroll is complete
+            if (onScrollComplete) {
+                onScrollComplete();
+            }
+        }
+    }, [scrollToRideId, calls, onScrollComplete]);
+
+    // Initial fetch on mount
     useEffect(() => {
         fetchOpenCalls();
+    }, []);
 
+    // SignalR setup - DO NOT cleanup listeners (persist across tab switches)
+    useEffect(() => {
         // Listen for new calls
         const unsubNewCall = signalRService.onNewCallReceived((call) => {
             console.log('New call received:', call);
+
+            // Check if this call is pre-assigned to us
+            // Pre-assigned calls should go to Active calls, not Open calls
+            const myDriverId = user?.userId || signalRService.getDriverId();
+            const isPreassignedToMe = call.assignedToId && String(call.assignedToId) === String(myDriverId);
+
+            if (isPreassignedToMe) {
+                console.log('Call is pre-assigned to us, not adding to Open calls:', call.rideId);
+                // Don't add to open calls - it will show in Active calls
+                return;
+            }
+
             setCalls(prev => {
                 // Avoid duplicates
                 if (prev.some(c => c.rideId === call.rideId)) {
                     return prev;
                 }
-                return [call, ...prev];
+                return [...prev, call].sort((a, b) => new Date(a.scheduledFor) - new Date(b.scheduledFor));
             });
         });
 
@@ -177,21 +282,15 @@ const OpenCallsScreen = () => {
                         console.log('We successfully got assigned to call:', data.rideId);
                         hasShownSuccessRef.current = true;
                         setAssigningCallId(null);
-                        Alert.alert(
-                            'Call Assigned',
-                            'This call has been assigned to you. View it in the Active tab.',
-                            [{ text: 'OK' }]
-                        );
+                        showToast('Call assigned! View it in the Active tab.', 'success');
+                        // Reload open calls to filter out any now-overlapping calls
+                        fetchOpenCalls();
                     }
                 } else {
                     // Someone else got it before us
                     console.log('Someone else got the call we were trying to take:', data.rideId);
                     setAssigningCallId(null);
-                    Alert.alert(
-                        'Call Unavailable',
-                        'This call was just taken by another driver.',
-                        [{ text: 'OK' }]
-                    );
+                    showToast('This call was just taken by another driver.', 'warning');
                 }
             }
 
@@ -206,6 +305,13 @@ const OpenCallsScreen = () => {
             // For adding calls to the list, we listen to CallAvailableAgain below
         });
 
+        // Listen for canceled calls (remove from list)
+        const unsubCanceled = signalRService.onCallCanceled((data) => {
+            console.log('Call canceled, removing from list:', data);
+            // Remove the canceled call from the open calls list
+            setCalls(prev => prev.filter(call => call.rideId !== data.rideId));
+        });
+
         // Listen for calls becoming available again (reassigned - add to open calls list)
         const unsubCallAvailable = signalRService.onCallAvailableAgain((data) => {
             console.log('Call available again, adding to list:', data);
@@ -214,33 +320,23 @@ const OpenCallsScreen = () => {
                 if (prev.some(c => c.rideId === data.rideId)) {
                     return prev;
                 }
-                // Reconstruct call object from available data
+                // Server sends the full Ride object, so we can use it directly
+                // Just normalize the property names to match what the UI expects (lowercase first letter)
                 const call = {
                     rideId: data.rideId,
                     customerName: data.customerName,
-                    customerPhoneNumber: data.customerPhone,
-                    route: {
-                        pickup: data.pickup,
-                        dropOff: data.dropoff,
-                        stop1: data.stops?.[0],
-                        stop2: data.stops?.[1],
-                        stop3: data.stops?.[2],
-                        stop4: data.stops?.[3],
-                        stop5: data.stops?.[4],
-                        stop6: data.stops?.[5],
-                        stop7: data.stops?.[6],
-                        stop8: data.stops?.[7],
-                        stop9: data.stops?.[8],
-                        stop10: data.stops?.[9],
-                        roundTrip: data.roundTrip
-                    },
+                    customerPhoneNumber: data.customerPhoneNumber,
+                    route: data.route, // Full route object already included
                     callTime: data.callTime,
                     scheduledFor: data.scheduledFor,
                     cost: data.cost,
                     paymentType: data.paymentType,
-                    notes: data.notes
+                    notes: data.notes,
+                    passengers: data.passengers,
+                    carType: data.carType,
+                    estimatedDuration: data.route?.estimatedDuration
                 };
-                return [call, ...prev];
+                return [...prev, call].sort((a, b) => new Date(a.scheduledFor) - new Date(b.scheduledFor));
             });
         });
 
@@ -252,11 +348,9 @@ const OpenCallsScreen = () => {
             if (!hasShownSuccessRef.current) {
                 hasShownSuccessRef.current = true;
                 setAssigningCallId(null);
-                Alert.alert(
-                    'Call Assigned',
-                    'This call has been assigned to you. View it in the Active tab.',
-                    [{ text: 'OK' }]
-                );
+                showToast('Call assigned! View it in the Active tab.', 'success');
+                // Reload open calls to filter out any now-overlapping calls
+                fetchOpenCalls();
             }
         });
 
@@ -265,25 +359,17 @@ const OpenCallsScreen = () => {
         const unsubAlreadyAssigned = signalRService.onCallAlreadyAssigned((data) => {
             console.log('Call already assigned (direct response):', data);
             setAssigningCallId(null);
-            Alert.alert(
-                'Call Unavailable',
-                data.message || 'This call has already been taken by another driver.',
-                [{ text: 'OK' }]
-            );
+            showToast(data.message || 'This call has already been taken by another driver.', 'warning');
             // Remove this call from our list since it's taken
             setCalls(prev => prev.filter(call => call.rideId !== data.rideId));
         });
 
-        // Cleanup listeners on unmount
+        // DO NOT cleanup listeners - they should persist across tab switches
+        // Only cleanup when component is truly destroyed (app logout)
         return () => {
-            unsubNewCall();
-            unsubAssigned();
-            unsubUnassigned();
-            unsubCallAvailable();
-            unsubAssignmentSuccess();
-            unsubAlreadyAssigned();
+            // NO-OP - listeners persist
         };
-    }, []); // Empty deps - we use refs to access current values
+    }, []); // Empty deps - set up once and never cleanup
 
     // Pull-to-refresh handler
     const onRefresh = () => {
@@ -304,7 +390,7 @@ const OpenCallsScreen = () => {
         }
 
         if (!signalRService.isConnected()) {
-            Alert.alert(
+            showAlert(
                 'Connection Error',
                 'Not connected to server. Please check your internet connection and try again.',
                 [{ text: 'OK' }]
@@ -320,7 +406,7 @@ const OpenCallsScreen = () => {
         } catch (error) {
             console.error('Error requesting call assignment:', error);
             setAssigningCallId(null);
-            Alert.alert(
+            showAlert(
                 'Error',
                 'Failed to request call assignment. Please try again.',
                 [{ text: 'OK' }]
@@ -332,6 +418,7 @@ const OpenCallsScreen = () => {
     const renderCallItem = ({ item }) => {
         const isAssigning = assigningCallId === item.rideId;
         const isDisabled = isAssigning || assigningCallId !== null;
+        const isHighlighted = highlightedRideId === item.rideId;
 
         // Count the number of stops
         const stopCount = [item.route?.stop1, item.route?.stop2, item.route?.stop3,
@@ -339,12 +426,26 @@ const OpenCallsScreen = () => {
         item.route?.stop8, item.route?.stop9, item.route?.stop10]
             .filter(stop => stop && stop.trim() !== '').length;
 
+        // Check if distance is already calculated for this call
+        const hasDistance = distanceCache[item.rideId]?.duration && distanceCache[item.rideId]?.distance;
+        const isLoadingDistance = distanceCache[item.rideId]?.loading;
+
         return (
-            <TouchableOpacity
-                style={[styles.callCard, { backgroundColor: colors.card }, isAssigning && styles.callCardAssigning]}
-                onPress={() => handleCallPress(item)}
-                disabled={isDisabled}
+            <View
+                style={[
+                    styles.callCard,
+                    { backgroundColor: colors.card },
+                    isAssigning && styles.callCardAssigning,
+                    isHighlighted && { borderColor: colors.primary, borderWidth: 3 }
+                ]}
             >
+                {/* Highlight badge for push notification scroll */}
+                {isHighlighted && (
+                    <View style={[styles.highlightBadge, { backgroundColor: colors.primary }]}>
+                        <Text style={styles.highlightBadgeText}>📍 New Call</Text>
+                    </View>
+                )}
+
                 {isAssigning && (
                     <View style={styles.assigningOverlay}>
                         <ActivityIndicator size="small" color="#fff" />
@@ -363,6 +464,18 @@ const OpenCallsScreen = () => {
                         </Text>
                     </View>
                 </View>
+
+                {/* Recurring Ride Badge */}
+                {item.isRecurring && (
+                    <View style={styles.recurringBadge}>
+                        <Text style={styles.recurringBadgeText}>🔁 RECURRING RIDE</Text>
+                        {item.recurring && (
+                            <Text style={styles.recurringDetails}>
+                                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][item.recurring.dayOfWeek]} at {formatTimeOnly(item.recurring.time)} until {formatDate(item.recurring.endDate)}
+                            </Text>
+                        )}
+                    </View>
+                )}
 
                 <View style={styles.routeContainer}>
                     <View style={styles.routeRow}>
@@ -386,49 +499,66 @@ const OpenCallsScreen = () => {
                         <Text style={styles.cost}>
                             {item.cost ? `$${item.cost.toFixed(2)}` : 'Price TBD'}
                         </Text>
+                        {item.carSeat && (
+                            <View style={styles.carSeatChip}>
+                                <Text style={styles.carSeatChipText}>🚼 Car Seat</Text>
+                            </View>
+                        )}
+                    </View>
+                    <View style={styles.rightSection}>
                         <Text style={[styles.paymentType, { backgroundColor: colors.background, color: colors.textSecondary }]}>
                             {item.paymentType || 'Cash'}
                         </Text>
-                    </View>
-                    <View style={styles.rightSection}>
-                        {formatEstimatedDuration(item.estimatedDuration) && (
+                        {formatEstimatedDuration(item.route?.estimatedDuration) && (
                             <Text style={[styles.tripDuration, { color: colors.primary }]}>
-                                🕐 {formatEstimatedDuration(item.estimatedDuration)}
+                                🕐 {formatEstimatedDuration(item.route?.estimatedDuration)}
                             </Text>
                         )}
-                        {/* Distance to pickup - on-demand */}
-                        {distanceCache[item.rideId]?.loading ? (
-                            <ActivityIndicator size="small" color={colors.primary} style={styles.distanceLoader} />
-                        ) : distanceCache[item.rideId]?.duration && distanceCache[item.rideId]?.duration ? (
+                        {/* Show distance info if already calculated */}
+                        {hasDistance && (
                             <>
                                 <Text style={[styles.distanceText, { color: colors.textSecondary }]}>
                                     🚗 {distanceCache[item.rideId].duration} away
                                 </Text>
                                 <Text style={[styles.distanceText, { color: colors.textSecondary }]}>
-                                    📍 {distanceCache[item.rideId].distance} away
+                                    📍 {distanceCache[item.rideId].distance}
                                 </Text>
                             </>
-                        ) : (
-                            <TouchableOpacity
-                                onPress={(e) => {
-                                    e.stopPropagation();
-                                    calculateDistance(item.rideId, item.route?.pickup);
-                                }}
-                                style={styles.distanceButton}
-                            >
-                                <Text style={[styles.distanceButtonText, { color: colors.primary }]}>
-                                    Show distance to Pickup
-                                </Text>
-                            </TouchableOpacity>
                         )}
                     </View>
                 </View>
 
-                {/* Tap hint */}
-                <View style={styles.tapHint}>
-                    <Text style={[styles.tapHintText, { color: colors.primary }]}>Tap to accept</Text>
+                {/* Action Buttons */}
+                <View style={styles.actionButtonsRow}>
+                    {/* Accept Button - Green */}
+                    <TouchableOpacity
+                        style={[styles.acceptButton, isDisabled && styles.buttonDisabled]}
+                        onPress={() => handleCallPress(item)}
+                        disabled={isDisabled}
+                    >
+                        {isAssigning ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                            <Text style={styles.acceptButtonText}>✓ Accept</Text>
+                        )}
+                    </TouchableOpacity>
+
+                    {/* Show Distance Button - Blue */}
+                    <TouchableOpacity
+                        style={[styles.distanceActionButton, isLoadingDistance && styles.buttonDisabled]}
+                        onPress={() => calculateDistance(item.rideId, item.route?.pickup)}
+                        disabled={isLoadingDistance}
+                    >
+                        {isLoadingDistance ? (
+                            <ActivityIndicator size="small" color="#fff" />
+                        ) : (
+                            <Text style={styles.distanceActionButtonText}>
+                                {hasDistance ? '↻ Refresh' : '📍 Distance'}
+                            </Text>
+                        )}
+                    </TouchableOpacity>
                 </View>
-            </TouchableOpacity>
+            </View>
         );
     };
 
@@ -441,7 +571,26 @@ const OpenCallsScreen = () => {
         </View>
     );
 
-    if (loading) {
+    // No cars / no primary car state
+    const renderNoCarsState = () => (
+        <View style={styles.emptyContainer}>
+            <Text style={styles.emptyIcon}>🚗</Text>
+            <Text style={[styles.emptyText, { color: colors.textSecondary }]}>No Vehicle Set Up</Text>
+            <Text style={[styles.emptySubtext, { color: colors.textMuted, textAlign: 'center', paddingHorizontal: 20 }]}>
+                You need to add a car and set it as your primary vehicle before you can see and accept calls.
+            </Text>
+            {onNavigateToCars && (
+                <TouchableOpacity
+                    style={[styles.addCarButton, { backgroundColor: colors.primary }]}
+                    onPress={onNavigateToCars}
+                >
+                    <Text style={styles.addCarButtonText}>Add a Car</Text>
+                </TouchableOpacity>
+            )}
+        </View>
+    );
+
+    if (loading || carsLoading) {
         return (
             <View style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
                 <ActivityIndicator size="large" color={colors.primary} />
@@ -450,22 +599,52 @@ const OpenCallsScreen = () => {
         );
     }
 
+    // Show "no cars" message if driver doesn't have a primary car
+    if (!hasPrimaryCar) {
+        return (
+            <View style={[styles.container, { backgroundColor: colors.background }]}>
+                {renderNoCarsState()}
+            </View>
+        );
+    }
+
     return (
         <View style={[styles.container, { backgroundColor: colors.background }]}>
             <FlatList
+                ref={flatListRef}
                 data={calls}
                 keyExtractor={(item) => String(item.rideId)}
                 renderItem={renderCallItem}
                 contentContainerStyle={calls.length === 0 ? styles.emptyList : styles.list}
                 ListEmptyComponent={renderEmptyState}
+                scrollEnabled={!assigningCallId}
                 refreshControl={
                     <RefreshControl
                         refreshing={refreshing}
                         onRefresh={onRefresh}
                         colors={[colors.primary]}
+                        enabled={!assigningCallId}
                     />
                 }
+                // Handle scroll to index failures gracefully
+                onScrollToIndexFailed={(info) => {
+                    console.log('Scroll to index failed:', info);
+                    // Scroll to approximate position based on average item height
+                    flatListRef.current?.scrollToOffset({
+                        offset: info.averageItemLength * info.index,
+                        animated: true
+                    });
+                }}
             />
+            {/* Blocking overlay when assigning a call */}
+            {assigningCallId && (
+                <View style={styles.blockingOverlay}>
+                    <View style={styles.overlayContent}>
+                        <ActivityIndicator size="large" color={colors.primary} />
+                        <Text style={[styles.overlayText, { color: colors.text }]}>Accepting call...</Text>
+                    </View>
+                </View>
+            )}
         </View>
     );
 };
@@ -595,6 +774,27 @@ const styles = StyleSheet.create({
     distanceLoader: {
         marginTop: 4,
     },
+    recurringBadge: {
+        backgroundColor: '#FFF3E0',
+        borderLeftWidth: 4,
+        borderLeftColor: '#FF9800',
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        marginTop: 10,
+        marginBottom: 5,
+        borderRadius: 4,
+    },
+    recurringBadgeText: {
+        fontSize: 14,
+        fontWeight: '700',
+        color: '#E65100',
+        marginBottom: 2,
+    },
+    recurringDetails: {
+        fontSize: 12,
+        color: '#EF6C00',
+        fontWeight: '600',
+    },
     paymentType: {
         fontSize: 14,
         color: '#666',
@@ -604,6 +804,20 @@ const styles = StyleSheet.create({
         marginTop: 4,
         alignSelf: 'flex-start',
         borderRadius: 12,
+    },
+    carSeatChip: {
+        backgroundColor: '#ffb4b4ff',
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: '#ff0000ff',
+        marginLeft: 8,
+    },
+    carSeatChipText: {
+        fontSize: 11,
+        fontWeight: '600',
+        color: '#d21e1eff',
     },
     emptyContainer: {
         alignItems: 'center',
@@ -620,6 +834,17 @@ const styles = StyleSheet.create({
     emptySubtext: {
         fontSize: 14,
         color: '#999',
+    },
+    addCarButton: {
+        marginTop: 20,
+        paddingVertical: 14,
+        paddingHorizontal: 30,
+        borderRadius: 10,
+    },
+    addCarButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '600',
     },
     // Styles for call assignment state
     callCardAssigning: {
@@ -646,14 +871,82 @@ const styles = StyleSheet.create({
         fontWeight: '600',
         marginTop: 8,
     },
-    tapHint: {
-        marginTop: 8,
-        alignItems: 'center',
+    // Highlight badge for push notification scroll-to
+    highlightBadge: {
+        position: 'absolute',
+        top: -10,
+        right: 10,
+        paddingHorizontal: 12,
+        paddingVertical: 4,
+        borderRadius: 12,
+        zIndex: 10,
     },
-    tapHintText: {
+    highlightBadgeText: {
+        color: '#fff',
         fontSize: 12,
-        color: '#007AFF',
-        fontWeight: '500',
+        fontWeight: '600',
+    },
+    // Action buttons row
+    actionButtonsRow: {
+        flexDirection: 'row',
+        marginTop: 12,
+        gap: 10,
+    },
+    acceptButton: {
+        flex: 1,
+        backgroundColor: '#2ecc71',
+        paddingVertical: 12,
+        borderRadius: 8,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    acceptButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    distanceActionButton: {
+        flex: 1,
+        backgroundColor: '#3498db',
+        paddingVertical: 12,
+        borderRadius: 8,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    distanceActionButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '600',
+    },
+    buttonDisabled: {
+        opacity: 0.6,
+    },
+    blockingOverlay: {
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        zIndex: 999,
+    },
+    overlayContent: {
+        backgroundColor: '#fff',
+        padding: 30,
+        borderRadius: 12,
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.25,
+        shadowRadius: 4,
+        elevation: 5,
+    },
+    overlayText: {
+        marginTop: 15,
+        fontSize: 16,
+        fontWeight: '600',
     },
 });
 

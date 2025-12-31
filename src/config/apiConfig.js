@@ -46,7 +46,8 @@ const config = {
             ADD_STOP: '/api/Ride/AddStop',
             UPDATE_PRICE: '/api/Ride/UpdatePrice',
             ADD_TIP: '/api/Ride/AddTip',
-            ADD_WAIT_TIME: '/api/Ride/AddWaitTime'
+            ADD_WAIT_TIME: '/api/Ride/AddWaitTime',
+            CALCULATE_DISTANCE: '/api/Ride/CalculateDistance'
         },
         DRIVERS: {
             GET_ALL: '/api/User/AllDrivers',
@@ -75,6 +76,26 @@ const config = {
             GET_ALL_MESSAGES: '/api/Communication/AllCom',
             MARK_READ: '/api/Communication/MarkAsRead',
             GET_UNREAD_COUNT: '/api/Communication/driverUnreadCount'
+        },
+        USER: {
+            UPDATE_PASSWORD: '/api/user/UpdatePassword',
+            FORGOT_PASSWORD: '/api/user/ForgotPassword'
+        },
+        // Push notification endpoints - for registering Expo Push Tokens
+        PUSH_NOTIFICATIONS: {
+            REGISTER_TOKEN: '/api/User/RegisterPushToken',
+            UNREGISTER_TOKEN: '/api/User/UnregisterPushToken'
+        },
+        // Notification preferences endpoints
+        NOTIFICATIONS: {
+            GET_PREFERENCES: '/api/Notification/GetPreferences',
+            UPDATE_PREFERENCES: '/api/Notification/UpdatePreferences'
+        },
+        // Payment endpoints - Square payment processing
+        PAYMENT: {
+            CHARGE_CARD: '/api/Payment/ChargeCard',
+            TOKENIZE_AND_CHARGE_CARD: '/api/Payment/TokenizeAndChargeCard',
+            VERIFY_TOKEN: '/api/Payment/VerifyToken'
         }
     },
 
@@ -104,6 +125,14 @@ const TOKEN_KEY = 'driver_jwt_token';
 
 // Cache the token in memory to avoid async calls on every request
 let cachedToken = null;
+
+// Global reference to AuthContext's forceLogout function
+// This is set by AuthContext on mount
+let globalForceLogout = null;
+
+export const setForceLogoutCallback = (callback) => {
+    globalForceLogout = callback;
+};
 
 export const tokenManager = {
     // Async method to get token from storage
@@ -152,6 +181,7 @@ apiClient.interceptors.request.use(
     (requestConfig) => {
         // Use sync method to get cached token
         const token = tokenManager.getTokenSync();
+        console.log('Using token in request interceptor:', token);
         if (token) {
             requestConfig.headers.Authorization = `Bearer ${token}`;
         }
@@ -161,6 +191,8 @@ apiClient.interceptors.request.use(
             console.log('API Request:', {
                 method: requestConfig.method?.toUpperCase(),
                 url: requestConfig.url,
+                baseURL: requestConfig.baseURL || config.API_BASE_URL,
+                fullURL: `${requestConfig.baseURL || config.API_BASE_URL}${requestConfig.url}`,
                 hasToken: !!token,
                 body: requestConfig.data,
             });
@@ -195,13 +227,36 @@ apiClient.interceptors.response.use(
     async (error) => {
         const originalRequest = error.config;
 
-        // Handle 401 Unauthorized - token expired or invalid
-        if (error.response?.status === 401 && !originalRequest._retry) {
+        // Log error details FIRST (always log to help debugging)
+        console.error('=== API ERROR ===');
+        console.error('Status:', error.response?.status);
+        console.error('Message:', error.message);
+        console.error('URL:', error.config?.url);
+        console.error('Full URL:', `${error.config?.baseURL || config.API_BASE_URL}${error.config?.url}`);
+        console.error('Response Data:', error.response?.data);
+        console.error('Request Data:', error.config?.data);
+        console.error('=================');
+
+        // Don't try to refresh token on login endpoint (401 means invalid credentials)
+        const isLoginEndpoint = error.config?.url?.includes('/login');
+
+        // Handle 401 Unauthorized - token expired or invalid (but not on login)
+        if (error.response?.status === 401 && !originalRequest._retry && !isLoginEndpoint) {
             originalRequest._retry = true;
+
+            // Only try to refresh if we have a token
+            const currentToken = tokenManager.getTokenSync();
+            if (!currentToken) {
+                console.error('No token available - cannot refresh');
+                // Force logout since we have no token
+                if (globalForceLogout) {
+                    await globalForceLogout();
+                }
+                return Promise.reject(error);
+            }
 
             // Try to refresh token
             try {
-                const currentToken = tokenManager.getTokenSync();
                 const response = await axios.post(
                     `${config.API_BASE_URL}${config.ENDPOINTS.AUTH.REFRESH}`,
                     {},
@@ -218,20 +273,18 @@ apiClient.interceptors.response.use(
                     return apiClient(originalRequest);
                 }
             } catch (refreshError) {
-                // Refresh failed - clear token
-                // Navigation to login is handled by AuthContext
+                // Refresh failed - clear token and force logout
+                console.error('Token refresh failed - logging out');
                 await tokenManager.removeToken();
+
+                // Call forceLogout if available to update UI state
+                if (globalForceLogout) {
+                    await globalForceLogout();
+                }
+
                 return Promise.reject(refreshError);
             }
         }
-
-        // Log error details
-        console.error('API Error:', {
-            status: error.response?.status,
-            message: error.message,
-            url: error.config?.url,
-            data: error.response?.data
-        });
 
         return Promise.reject(error);
     }

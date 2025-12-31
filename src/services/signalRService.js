@@ -1,6 +1,8 @@
 import * as signalR from '@microsoft/signalr';
 import { AppState } from 'react-native';
 import * as Location from 'expo-location';
+import { SIGNALR_HUB_URL } from '../config/environment';
+import { tokenManager } from '../config/apiConfig';
 
 class SignalRService {
     constructor() {
@@ -14,6 +16,8 @@ class SignalRService {
         this.callAlreadyAssignedCallbacks = [];  // When driver tries to take an already-taken call
         this.callAssignmentSuccessCallbacks = []; // When this driver successfully takes a call
         this.callCanceledCallbacks = []; // When a call is canceled
+        this.pickupTimeResetCallbacks = []; // When pickup time is reset by dispatcher
+        this.messageMarkedAsReadCallbacks = []; // When a message is marked as read
         this.driverId = null;
         this.isRegistered = false;
         this.heartbeatInterval = null;
@@ -25,7 +29,7 @@ class SignalRService {
         this.locationUpdateInterval = 5000; // 5 seconds between updates
     }
 
-    async initialize(driverId, hubUrl = 'http://192.168.1.41:5062/hubs/dispatch') {
+    async initialize(driverId, hubUrl = SIGNALR_HUB_URL) {
         if (this.connection && this.connection.state === signalR.HubConnectionState.Connected) {
             console.log('SignalR already initialized and connected');
             return;
@@ -33,13 +37,20 @@ class SignalRService {
 
         this.driverId = driverId;
 
+        console.log(`🔌 SignalR: Attempting to connect to ${hubUrl}`);
+
+        // Get JWT token for authentication
+        const token = tokenManager.getTokenSync();
+        console.log(`🔑 SignalR: Using JWT token: ${token ? 'Yes' : 'No'}`);
+
         this.connection = new signalR.HubConnectionBuilder()
             .withUrl(hubUrl, {
                 skipNegotiation: true,
-                transport: signalR.HttpTransportType.WebSockets
+                transport: signalR.HttpTransportType.WebSockets,
+                accessTokenFactory: () => token // Add JWT token for authentication
             })
             .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
-            .configureLogging(signalR.LogLevel.Warning)
+            .configureLogging(signalR.LogLevel.Information)
             .build();
 
         // Handle incoming messages
@@ -90,10 +101,22 @@ class SignalRService {
             this.callCanceledCallbacks.forEach(callback => callback(data));
         });
 
+        // Handle when pickup time is reset
+        this.connection.on('PickupTimeReset', (data) => {
+            console.log('Pickup time reset:', data);
+            this.pickupTimeResetCallbacks.forEach(callback => callback(data));
+        });
+
         // Handle call updates
         this.connection.on('CallUpdated', (update) => {
             console.log('Call updated:', update);
             this.callUpdateCallbacks.forEach(callback => callback(update));
+        });
+
+        // Handle message marked as read notification
+        this.connection.on('MessageMarkedAsRead', (data) => {
+            console.log('Message marked as read:', data);
+            this.messageMarkedAsReadCallbacks.forEach(callback => callback(data));
         });
 
         // Handle reconnection
@@ -369,7 +392,7 @@ class SignalRService {
      * @param {string} message - The message text to send
      * @param {number|null} rideId - Optional ride ID to associate with the message
      */
-    async sendMessageToDispatchers(message, rideId = null) {
+    async sendMessageToDispatchers(message, rideId = null, driverName = null) {
         if (!this.connection || this.connection.state !== signalR.HubConnectionState.Connected) {
             throw new Error('SignalR not connected');
         }
@@ -379,12 +402,14 @@ class SignalRService {
         }
 
         try {
-            await this.connection.invoke('DriverSendsMessage', {
+            const savedMessage = await this.connection.invoke('DriverSendsMessage', {
                 driverId: parseInt(this.driverId),
+                driverName: driverName || '',
                 message: message,
                 rideId: rideId
             });
-            console.log('✅ Message sent to dispatchers');
+            console.log('✅ Message sent to dispatchers, received ID:', savedMessage?.id || savedMessage?.Id);
+            return savedMessage;
         } catch (err) {
             console.error('Error sending message to dispatchers:', err);
             throw err;
@@ -481,6 +506,14 @@ class SignalRService {
         this.callCanceledCallbacks.push(callback);
         return () => {
             this.callCanceledCallbacks = this.callCanceledCallbacks.filter(cb => cb !== callback);
+        };
+    }
+
+    // Called when pickup time is reset by dispatcher
+    onPickupTimeReset(callback) {
+        this.pickupTimeResetCallbacks.push(callback);
+        return () => {
+            this.pickupTimeResetCallbacks = this.pickupTimeResetCallbacks.filter(cb => cb !== callback);
         };
     }
 
@@ -610,6 +643,46 @@ class SignalRService {
         } catch (err) {
             console.warn('Failed to notify ride completion:', err.message);
         }
+    }
+
+    /**
+     * Mark messages as read via SignalR
+     * This will update the database and notify the sender (dispatchers)
+     * 
+     * @param {number[]} messageIds - Array of message IDs to mark as read
+     */
+    async markMessagesAsRead(messageIds) {
+        if (!this.connection || this.connection.state !== signalR.HubConnectionState.Connected) {
+            console.warn('Cannot mark messages as read: SignalR not connected');
+            return;
+        }
+
+        if (!messageIds || messageIds.length === 0) {
+            console.warn('No message IDs provided to mark as read');
+            return;
+        }
+
+        try {
+            await this.connection.invoke('MarkMessagesAsRead', messageIds, 'driver');
+            console.log('✅ Marked messages as read:', messageIds);
+        } catch (err) {
+            console.error('Failed to mark messages as read:', err);
+            throw err;
+        }
+    }
+
+    /**
+     * Subscribe to message marked as read events
+     * Called when a dispatcher marks your message as read
+     * 
+     * @param {function} callback - Callback function to handle read receipt
+     * @returns {function} Unsubscribe function
+     */
+    onMessageMarkedAsRead(callback) {
+        this.messageMarkedAsReadCallbacks.push(callback);
+        return () => {
+            this.messageMarkedAsReadCallbacks = this.messageMarkedAsReadCallbacks.filter(cb => cb !== callback);
+        };
     }
 }
 

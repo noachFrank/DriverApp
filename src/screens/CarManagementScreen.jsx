@@ -21,17 +21,18 @@ import {
     ActivityIndicator,
     Modal,
     TextInput,
-    Alert,
     ScrollView
 } from 'react-native';
 import { carsAPI } from '../services/apiService';
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAlert } from '../contexts/AlertContext';
 
 const CarManagementScreen = ({ onBack }) => {
     const { user } = useAuth();
     const { theme } = useTheme();
     const colors = theme.colors;
+    const { showAlert, showToast } = useAlert();
     const [cars, setCars] = useState([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -45,8 +46,9 @@ const CarManagementScreen = ({ onBack }) => {
         { label: 'SUV', value: 'SUV', icon: '🚙' },
         { label: 'Mini Van', value: 'MiniVan', icon: '🚐' },
         { label: '12 Passenger', value: 'TwelvePass', icon: '🚌' },
-        { label: '15 Passenger', value: 'FifteenPass', icon: '🚌' },
+        { label: '15 Passenger', value: 'FifteenPass', icon: '🚋' },
         { label: 'Luxury SUV', value: 'LuxurySUV', icon: '✨' },
+        { label: 'Mercedes Sprinter', value: 'MercSprinter', icon: '🚎' }
     ];
 
     // Form state for add/edit modal
@@ -119,14 +121,15 @@ const CarManagementScreen = ({ onBack }) => {
     const handleSaveCar = async () => {
         // Validate required fields
         if (!formData.make.trim() || !formData.model.trim() || !formData.year.trim() || !formData.color.trim() || !formData.licensePlate.trim() || !formData.seats.trim()) {
-            Alert.alert('Error',
-                `Please fill in ${!formData.make.trim() ? 'Make, ' : ''}${!formData.model.trim() ? 'Model, ' : ''}${!formData.year.trim() ? 'Year, ' : ''}${!formData.color.trim() ? 'Color, ' : ''}${!formData.licensePlate.trim() ? 'License Plate, ' : ''}${!formData.seats.trim() ? 'Seats' : ''}`);
+            showAlert('Error',
+                `Please fill in ${!formData.make.trim() ? 'Make, ' : ''}${!formData.model.trim() ? 'Model, ' : ''}${!formData.year.trim() ? 'Year, ' : ''}${!formData.color.trim() ? 'Color, ' : ''}${!formData.licensePlate.trim() ? 'License Plate, ' : ''}${!formData.seats.trim() ? 'Seats' : ''}`,
+                [{ text: 'OK' }]);
             return;
         }
 
         const seatsNum = parseInt(formData.seats);
         if (isNaN(seatsNum) || seatsNum < 1) {
-            Alert.alert('Error', 'Seats must be a valid number (at least 1)');
+            showAlert('Error', 'Seats must be a valid number (at least 1)', [{ text: 'OK' }]);
             return;
         }
 
@@ -146,7 +149,7 @@ const CarManagementScreen = ({ onBack }) => {
                 // Update existing car
                 carData.carId = editingCar.carId;
                 await carsAPI.update(carData);
-                Alert.alert('Success', 'Car updated successfully');
+                showToast('Car updated successfully', 'success');
             } else {
                 // Add new car
                 console.log();
@@ -157,14 +160,14 @@ const CarManagementScreen = ({ onBack }) => {
 
                 console.log('Creating car with data:', carData);
                 await carsAPI.create(carData);
-                Alert.alert('Success', 'Car added successfully');
+                showToast('Car added successfully', 'success');
             }
 
             setModalVisible(false);
             fetchCars(); // Refresh the list
         } catch (error) {
             console.error('Error saving car:', error);
-            Alert.alert('Error', 'Failed to save car. Please try again.');
+            showAlert('Error', 'Failed to save car. Please try again.', [{ text: 'OK' }]);
         } finally {
             setSaving(false);
         }
@@ -174,11 +177,11 @@ const CarManagementScreen = ({ onBack }) => {
     const handleSetPrimary = async (car) => {
         try {
             await carsAPI.setPrimary(car.carId);
-            Alert.alert('Success', `${car.make} ${car.model} is now your primary car`);
+            showToast(`${car.make} ${car.model} is now your primary car`, 'success');
             fetchCars(); // Refresh to show updated primary status
         } catch (error) {
             console.error('Error setting primary car:', error);
-            Alert.alert('Error', 'Failed to set primary car. Please try again.');
+            showAlert('Error', 'Failed to set primary car. Please try again.', [{ text: 'OK' }]);
         }
     };
 

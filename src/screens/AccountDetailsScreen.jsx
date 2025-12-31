@@ -15,8 +15,9 @@ import {
 } from 'react-native';
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { formatDate } from '../utils/dateHelpers';
 
-const AccountDetailsScreen = ({ onBack }) => {
+const AccountDetailsScreen = ({ onBack, onNavigateToChangePassword }) => {
     const { user } = useAuth();
     const { theme } = useTheme();
     const colors = theme.colors;
@@ -85,6 +86,27 @@ const AccountDetailsScreen = ({ onBack }) => {
                     </View>
                 </View>
 
+                {/* Security Section */}
+                <View style={styles.section}>
+                    <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>
+                        SECURITY
+                    </Text>
+
+                    <View style={[styles.card, { backgroundColor: colors.card }]}>
+                        <TouchableOpacity
+                            style={[styles.actionRow, { borderBottomColor: colors.divider }]}
+                            onPress={onNavigateToChangePassword}
+                        >
+                            <Text style={styles.infoIcon}>🔐</Text>
+                            <View style={styles.infoContent}>
+                                <Text style={[styles.actionLabel, { color: colors.text }]}>Change Password</Text>
+                                <Text style={[styles.actionSubtitle, { color: colors.textMuted }]}>Update your account password</Text>
+                            </View>
+                            <Text style={[styles.rowArrow, { color: colors.textMuted }]}>›</Text>
+                        </TouchableOpacity>
+                    </View>
+                </View>
+
                 {/* Driver Info */}
                 <View style={styles.section}>
                     <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>
@@ -100,7 +122,7 @@ const AccountDetailsScreen = ({ onBack }) => {
                         <InfoRow
                             icon="📅"
                             label="Member Since"
-                            value={user?.joinedDate ? new Date(user.joinedDate).toLocaleDateString() : null}
+                            value={user?.joinedDate ? formatDate(user.joinedDate) : null}
                         />
                         <InfoRow
                             icon="🆔"
@@ -109,6 +131,8 @@ const AccountDetailsScreen = ({ onBack }) => {
                         />
                     </View>
                 </View>
+
+
 
                 {/* Bottom spacing */}
                 <View style={{ height: 40 }} />
@@ -212,6 +236,25 @@ const styles = StyleSheet.create({
     },
     infoValue: {
         fontSize: 16,
+    },
+    actionRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 16,
+        paddingHorizontal: 16,
+        borderBottomWidth: 1,
+    },
+    actionLabel: {
+        fontSize: 16,
+        fontWeight: '500',
+        marginBottom: 2,
+    },
+    actionSubtitle: {
+        fontSize: 13,
+    },
+    rowArrow: {
+        fontSize: 24,
+        marginLeft: 8,
     },
 });
 

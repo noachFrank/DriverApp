@@ -37,7 +37,7 @@ import { ridesAPI } from '../services/apiService';
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
 import signalRService from '../services/signalRService';
-import { formatTime, formatEstimatedDuration } from '../utils/dateHelpers';
+import { formatTime, formatEstimatedDuration, formatDate, formatTimeOnly } from '../utils/dateHelpers';
 
 /**
  * Helper to format day label for grouping
@@ -103,7 +103,7 @@ const groupCallsByDay = (calls) => {
     return Object.values(groups).sort((a, b) => a.date - b.date);
 };
 
-const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
+const ActiveCallsScreen = ({ onCallSelect, onRefresh, onCountChange }) => {
     const { user } = useAuth();
     const { theme } = useTheme();
     const colors = theme.colors;
@@ -130,6 +130,11 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
 
             setCalls(sorted);
 
+            // Notify parent of count change
+            if (onCountChange) {
+                onCountChange(sorted.length);
+            }
+
             // Group by day
             const groups = groupCallsByDay(sorted);
             setDayGroups(groups);
@@ -142,19 +147,35 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
             console.error('Error fetching active calls:', error);
             setCalls([]);
             setDayGroups([]);
+            if (onCountChange) {
+                onCountChange(0);
+            }
         } finally {
             setLoading(false);
             setRefreshing(false);
         }
-    }, [user?.userId]);
+    }, [user?.userId, onCountChange]);
 
     // Initial load
+    // Fetch calls on mount
     useEffect(() => {
         fetchActiveCalls();
     }, [fetchActiveCalls]);
 
-    // Set up SignalR listeners for real-time updates
+    // Set up SignalR listeners - DO NOT cleanup (persist across tab switches)
     useEffect(() => {
+        // Listen for new pre-assigned calls (calls assigned to us at creation)
+        const unsubscribeNewCall = signalRService.onNewCallReceived((call) => {
+            // Check if this call is pre-assigned to us
+            const myDriverId = user?.userId;
+            const isPreassignedToMe = call.assignedToId && String(call.assignedToId) === String(myDriverId);
+
+            if (isPreassignedToMe) {
+                console.log('New pre-assigned call received, refreshing active calls list:', call.rideId);
+                fetchActiveCalls();
+            }
+        });
+
         // When driver is assigned a new call, refresh the list
         const unsubscribeAssigned = signalRService.onCallAssigned((data) => {
             console.log('Call assigned to me, refreshing active calls list');
@@ -173,12 +194,12 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
             fetchActiveCalls();
         });
 
+        // DO NOT cleanup listeners - they should persist across tab switches
+        // Only cleanup when component is truly destroyed (app logout)
         return () => {
-            unsubscribeAssigned?.();
-            unsubscribeUnassigned?.();
-            unsubscribeCanceled?.();
+            // NO-OP - listeners persist
         };
-    }, [fetchActiveCalls]);
+    }, [fetchActiveCalls, user?.userId]); // Include fetchActiveCalls so we use the latest version
 
     /**
      * Toggle day group expansion
@@ -228,7 +249,7 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
                 {/* Header with customer name and status chip */}
                 <View style={styles.cardHeader}>
                     <Text style={[styles.customerName, { color: colors.text }]} numberOfLines={1}>
-                        {item.customerName || 'Unknown Customer'}
+                        {item.customerName || ''}
                     </Text>
                     <View style={[styles.statusChip, { backgroundColor: status.bgColor }]}>
                         <Text style={[styles.statusText, { color: status.color }]}>
@@ -236,6 +257,18 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
                         </Text>
                     </View>
                 </View>
+
+                {/* Recurring Ride Badge */}
+                {item.isRecurring && (
+                    <View style={styles.recurringBadge}>
+                        <Text style={styles.recurringBadgeText}>🔁 RECURRING RIDE</Text>
+                        {item.recurring && (
+                            <Text style={styles.recurringDetails}>
+                                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][item.recurring.dayOfWeek]} at {formatTimeOnly(item.recurring.time)} until {formatDate(item.recurring.endDate)}
+                            </Text>
+                        )}
+                    </View>
+                )}
 
                 {/* Time */}
                 <View style={styles.timeRow}>
@@ -269,9 +302,14 @@ const ActiveCallsScreen = ({ onCallSelect, onRefresh }) => {
                     <Text style={styles.paymentLabel}>
                         💰 ${item.cost?.toFixed(2) || '0.00'}
                     </Text>
-                    {formatEstimatedDuration(item.estimatedDuration) && (
+                    {item.carSeat && (
+                        <View style={styles.carSeatChip}>
+                            <Text style={styles.carSeatChipText}>🚼</Text>
+                        </View>
+                    )}
+                    {formatEstimatedDuration(item.route?.estimatedDuration) && (
                         <Text style={[styles.tripDuration, { color: colors.primary }]}>
-                            🕐 {formatEstimatedDuration(item.estimatedDuration)}
+                            🕐 {formatEstimatedDuration(item.route?.estimatedDuration)}
                         </Text>
                     )}
                     <Text style={[styles.paymentType, { backgroundColor: colors.background, color: colors.textSecondary }]}>
@@ -536,6 +574,19 @@ const styles = StyleSheet.create({
         paddingVertical: 2,
         borderRadius: 4,
     },
+    carSeatChip: {
+        backgroundColor: '#ffb4b4ff',
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderColor: '#fd0202ff',
+    },
+    carSeatChipText: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#D2691E',
+    },
     emptyContainer: {
         flex: 1,
         justifyContent: 'center',
@@ -557,6 +608,27 @@ const styles = StyleSheet.create({
         color: '#666',
         textAlign: 'center',
         paddingHorizontal: 40,
+    },
+    recurringBadge: {
+        backgroundColor: '#FFF3E0',
+        borderLeftWidth: 4,
+        borderLeftColor: '#FF9800',
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        marginTop: 10,
+        marginBottom: 5,
+        borderRadius: 4,
+    },
+    recurringBadgeText: {
+        fontSize: 14,
+        fontWeight: '700',
+        color: '#E65100',
+        marginBottom: 2,
+    },
+    recurringDetails: {
+        fontSize: 12,
+        color: '#EF6C00',
+        fontWeight: '600',
     },
 });
 

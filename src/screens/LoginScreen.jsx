@@ -22,11 +22,12 @@ import {
     TouchableOpacity,
     StyleSheet,
     ActivityIndicator,
-    Alert,
     KeyboardAvoidingView,
     Platform
 } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../contexts/AuthContext';
+import { useAlert } from '../contexts/AlertContext';
 
 const LoginScreen = () => {
     // ============================================
@@ -37,9 +38,12 @@ const LoginScreen = () => {
     const [password, setPassword] = useState('');
     // This shows a loading spinner when logging in
     const [isLoading, setIsLoading] = useState(false);
+    // This controls password visibility
+    const [showPassword, setShowPassword] = useState(false);
 
     // Get the login function from AuthContext
     const { login } = useAuth();
+    const { showAlert } = useAlert();
 
     // ============================================
     // HANDLE LOGIN
@@ -47,7 +51,7 @@ const LoginScreen = () => {
     const handleLogin = async () => {
         // Don't allow empty fields
         if (!username.trim() || !password.trim()) {
-            Alert.alert('Error', 'Please enter both username and password');
+            showAlert('Error', 'Please enter both username and password', [{ text: 'OK' }]);
             return;
         }
 
@@ -68,11 +72,11 @@ const LoginScreen = () => {
                 console.log('Login successful! User ID:', result.userId);
             } else {
                 // Login failed - show error message
-                Alert.alert('Login Failed', result.message || 'Invalid credentials');
+                showAlert('Login Failed', result.message || 'Invalid credentials', [{ text: 'OK' }]);
             }
         } catch (error) {
             // Something went wrong (network error, server error, etc.)
-            Alert.alert('Error', 'Something went wrong. Please try again.');
+            showAlert('Error', 'Something went wrong. Please try again.', [{ text: 'OK' }]);
             console.error('Login error:', error);
         } finally {
             // Hide loading spinner
@@ -105,14 +109,29 @@ const LoginScreen = () => {
                 />
 
                 {/* Password Input */}
-                <TextInput
-                    style={styles.input}
-                    placeholder="Password"
-                    value={password}
-                    onChangeText={setPassword}
-                    secureTextEntry={true}
-                    editable={!isLoading}
-                />
+                <View style={styles.passwordContainer}>
+                    <TextInput
+                        style={styles.passwordInput}
+                        placeholder="Password"
+                        value={password}
+                        onChangeText={setPassword}
+                        secureTextEntry={!showPassword}
+                        editable={!isLoading}
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                    />
+                    <TouchableOpacity
+                        style={styles.eyeIcon}
+                        onPress={() => setShowPassword(!showPassword)}
+                        disabled={isLoading}
+                    >
+                        <Ionicons
+                            name={showPassword ? 'eye-off' : 'eye'}
+                            size={24}
+                            color="#666"
+                        />
+                    </TouchableOpacity>
+                </View>
 
                 {/* Login Button */}
                 <TouchableOpacity
@@ -175,6 +194,25 @@ const styles = StyleSheet.create({
         padding: 15,
         fontSize: 16,
         marginBottom: 15,
+    },
+    passwordContainer: {
+        position: 'relative',
+        marginBottom: 15,
+    },
+    passwordInput: {
+        backgroundColor: '#f9f9f9',
+        borderWidth: 1,
+        borderColor: '#ddd',
+        borderRadius: 8,
+        padding: 15,
+        paddingRight: 50,
+        fontSize: 16,
+    },
+    eyeIcon: {
+        position: 'absolute',
+        right: 15,
+        top: '50%',
+        transform: [{ translateY: -12 }],
     },
     button: {
         backgroundColor: '#007AFF',

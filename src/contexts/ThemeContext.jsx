@@ -49,6 +49,10 @@ export const themes = {
 
             // Overlay
             overlay: 'rgba(0, 0, 0, 0.5)',
+
+            // Switch colors
+            switchThumb: '#ffffff',
+            switchTrackOff: '#e0e0e0',
         }
     },
     dark: {
@@ -88,6 +92,10 @@ export const themes = {
 
             // Overlay
             overlay: 'rgba(0, 0, 0, 0.7)',
+
+            // Switch colors
+            switchThumb: '#f4f3f4',
+            switchTrackOff: '#3C3C3C',
         }
     }
 };

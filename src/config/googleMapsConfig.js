@@ -18,9 +18,9 @@ const API_KEYS = {
 const DEV_API_KEY = 'AIzaSyB4oZD9v6F-9KZGRyyt4mS1IuBayV3x3CU';
 
 // Set to true to use platform-specific keys, false for single dev key
-const USE_PLATFORM_KEYS = false;
+const USE_DEV_KEY = false;
 
 // Export the appropriate key based on platform
-export const GOOGLE_MAPS_API_KEY = USE_PLATFORM_KEYS
+export const GOOGLE_MAPS_API_KEY = USE_DEV_KEY
     ? (API_KEYS[Platform.OS] || DEV_API_KEY)
     : DEV_API_KEY;

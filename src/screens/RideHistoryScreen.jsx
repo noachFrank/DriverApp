@@ -40,7 +40,7 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { ridesAPI } from '../services/apiService';
-import { formatDate, formatTime } from '../utils/dateHelpers';
+import { formatDate, formatTime, formatTimeOnly } from '../utils/dateHelpers';
 
 const RideHistoryScreen = () => {
     const { user } = useAuth();
@@ -214,6 +214,18 @@ const RideHistoryScreen = () => {
                     <Text style={[styles.rideDate, { color: colors.textSecondary }]}>{formatDate(scheduledFor)}</Text>
                 </View>
 
+                {/* Recurring Ride Badge */}
+                {ride.isRecurring && (
+                    <View style={styles.recurringBadge}>
+                        <Text style={styles.recurringBadgeText}>🔁 RECURRING</Text>
+                        {ride.recurring && (
+                            <Text style={styles.recurringDetails}>
+                                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][ride.recurring.dayOfWeek]} at {formatTimeOnly(ride.recurring.time)}
+                            </Text>
+                        )}
+                    </View>
+                )}
+
                 {/* Times row */}
                 < View style={[styles.timesRow, { borderTopColor: colors.divider }]} >
                     {/* <View style={styles.timeBlock}>
@@ -221,7 +233,7 @@ const RideHistoryScreen = () => {
                         <Text style={styles.timeValue}>{formatTime(callTime)}</Text>
                     </View> */}
                     <View style={styles.timeBlock}>
-                        <Text style={[styles.timeLabel, { color: colors.textMuted }]}>Call Time</Text>
+                        <Text style={[styles.timeLabel, { color: colors.textMuted }]}>Ride Time</Text>
                         <Text style={[styles.timeValue, { color: colors.text }]}>{formatTime(scheduledFor)}</Text>
                     </View>
                     <View style={styles.timeBlock}>
@@ -544,6 +556,26 @@ const styles = StyleSheet.create({
         fontSize: 18,
         fontWeight: '700',
         color: '#27ae60',
+    },
+    recurringBadge: {
+        backgroundColor: '#FFF3E0',
+        borderLeftWidth: 4,
+        borderLeftColor: '#FF9800',
+        paddingVertical: 6,
+        paddingHorizontal: 10,
+        marginBottom: 8,
+        borderRadius: 4,
+    },
+    recurringBadgeText: {
+        fontSize: 12,
+        fontWeight: '700',
+        color: '#E65100',
+        marginBottom: 2,
+    },
+    recurringDetails: {
+        fontSize: 11,
+        color: '#EF6C00',
+        fontWeight: '600',
     },
 });
 

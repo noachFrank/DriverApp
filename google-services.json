@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "642017182614",
+    "project_id": "shias-transportation",
+    "storage_bucket": "shias-transportation.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:642017182614:android:ed3e570c1a0a049db2d3b7",
+        "android_client_info": {
+          "package_name": "com.shiasTransportation.driverapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCVLDfVMbDgfxrSZGXXemrjDFScRobrSq4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

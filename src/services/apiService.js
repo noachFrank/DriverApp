@@ -3,18 +3,24 @@ import config, { apiClient, tokenManager } from '../config/apiConfig';
 // Authentication API calls
 export const authAPI = {
     login: async (userType, username, password) => {
-        const response = await apiClient.post(config.ENDPOINTS.AUTH.LOGIN, {
-            userType: userType,
-            nameOrEmail: username,
-            password: password
-        });
+        try {
 
-        // Save JWT token if present in response
-        if (response.data?.token) {
-            tokenManager.setToken(response.data.token);
+            const response = await apiClient.post(config.ENDPOINTS.AUTH.LOGIN, {
+                userType: userType,
+                nameOrEmail: username,
+                password: password
+            });
+
+            // Save JWT token if present in response
+            if (response.data?.token) {
+                tokenManager.setToken(response.data.token);
+            }
+            console.log('Login response data:', response.data);
+            return response.data;
+        } catch (error) {
+            console.error('API login error:', error);
+            throw error;
         }
-        console.log('Login response data:', response.data);
-        return response.data;
     },
 
     logout: async (userType, userId) => {
@@ -158,11 +164,13 @@ export const ridesAPI = {
      * Update the price of a ride
      * @param {number} rideId - The ride ID
      * @param {number} amount - The new total amount
+     * @param {number} driversComp - The driver's compensation (optional, defaults to amount if not provided)
      */
-    updatePrice: async (rideId, amount) => {
+    updatePrice: async (rideId, amount, driversComp = null) => {
         const response = await apiClient.post(config.ENDPOINTS.RIDES.UPDATE_PRICE, {
             RideId: rideId,
-            Amount: amount
+            Amount: amount,
+            DriversComp: driversComp !== null ? driversComp : amount
         });
         return response.data;
     },
@@ -371,6 +379,156 @@ export const userAPI = {
     isAdmin: async (userId) => {
         const response = await apiClient.get(config.ENDPOINTS.USER.IS_ADMIN, {
             params: { userId }
+        });
+        return response.data;
+    },
+
+    updatePassword: async (userId, oldPassword, newPassword) => {
+        const response = await apiClient.post(config.ENDPOINTS.USER.UPDATE_PASSWORD, {
+            userId,
+            userType: 'driver',
+            oldPassword,
+            newPassword
+        });
+        return response.data;
+    },
+
+    forgotPassword: async (userId) => {
+        const response = await apiClient.post(config.ENDPOINTS.USER.FORGOT_PASSWORD, {
+            userId,
+            userType: 'driver'
+        });
+        return response.data;
+    }
+};
+
+/**
+ * Push Notification API
+ * 
+ * These endpoints handle registering/unregistering Expo Push Tokens with the server.
+ * The push token is unique to each device and is used by the server to send
+ * push notifications via Expo's push service.
+ */
+export const pushNotificationAPI = {
+    /**
+     * Register an Expo Push Token for a driver.
+     * Call this after successful login and after getting the push token from Expo.
+     * 
+     * @param {number} driverId - The driver's ID
+     * @param {string} pushToken - The Expo Push Token (e.g., "ExponentPushToken[xxx]")
+     */
+    registerToken: async (driverId, pushToken) => {
+        const response = await apiClient.post(config.ENDPOINTS.PUSH_NOTIFICATIONS.REGISTER_TOKEN, {
+            driverId: driverId,
+            pushToken: pushToken
+        });
+        return response.data;
+    },
+
+    /**
+     * Unregister the push token when driver logs out.
+     * This prevents notifications from being sent after logout.
+     * 
+     * @param {number} driverId - The driver's ID
+     */
+    unregisterToken: async (driverId) => {
+        const response = await apiClient.post(config.ENDPOINTS.PUSH_NOTIFICATIONS.UNREGISTER_TOKEN, driverId);
+        return response.data;
+    }
+};
+
+/**
+ * Notification Preferences API
+ * Manage push notification settings for drivers
+ */
+export const notificationAPI = {
+    /**
+     * Get notification preferences for a driver
+     * @param {number} driverId - The driver's ID
+     * @returns {Promise} Response with preferences object
+     */
+    getPreferences: async (driverId) => {
+        const response = await apiClient.get(config.ENDPOINTS.NOTIFICATIONS.GET_PREFERENCES, {
+            params: { driverId }
+        });
+        return response.data;
+    },
+
+    /**
+     * Update notification preferences for a driver
+     * @param {number} driverId - The driver's ID
+     * @param {object} preferences - Preferences object with all notification settings
+     * @returns {Promise} Response with updated preferences
+     */
+    updatePreferences: async (driverId, preferences) => {
+        const response = await apiClient.post(config.ENDPOINTS.NOTIFICATIONS.UPDATE_PREFERENCES, {
+            driverId,
+            ...preferences
+        });
+        return response.data;
+    }
+};
+
+/**
+ * Payment API
+ * Square payment processing for credit card transactions
+ */
+export const paymentAPI = {
+    /**
+     * Charge a credit card using a Square payment token
+     * @param {string} paymentTokenId - Square payment token (starts with "cnon:" or "ccof:")
+     * @param {number} amount - Amount in dollars (will be converted to cents)
+     * @param {number} rideId - The ride ID being charged
+     * @param {string} note - Optional note for the charge
+     * @returns {Promise} Response with success status and payment ID
+     */
+    chargeCard: async (paymentTokenId, amount, rideId, note = '') => {
+        const response = await apiClient.post(config.ENDPOINTS.PAYMENT.CHARGE_CARD, {
+            paymentTokenId,
+            amount,
+            rideId,
+            note
+        });
+        return response.data;
+    },
+
+    /**
+     * Tokenize and charge a credit card from manual entry (Driver CC)
+     * @param {string} cardNumber - Card number (digits only or with spaces)
+     * @param {string} expiryMonth - Expiry month (MM)
+     * @param {string} expiryYear - Expiry year (YY or YYYY)
+     * @param {string} cvv - Card CVV/CVC
+     * @param {string} cardholderName - Name on card
+     * @param {number} amount - Amount in dollars
+     * @param {number} rideId - The ride ID being charged
+     * @param {string} note - Optional note for the charge
+     * @returns {Promise} Response with success status and payment ID
+     */
+    tokenizeAndChargeCard: async (cardNumber, expiryMonth, expiryYear, cvv, cardholderName, amount, rideId, note = '') => {
+        // Remove spaces from card number
+        const cleanCardNumber = cardNumber.replace(/\s/g, '');
+
+        const response = await apiClient.post(config.ENDPOINTS.PAYMENT.TOKENIZE_AND_CHARGE_CARD, {
+            cardNumber: cleanCardNumber,
+            expiryMonth,
+            expiryYear,
+            cvv,
+            cardholderName,
+            amount,
+            rideId,
+            note
+        });
+        return response.data;
+    },
+
+    /**
+     * Verify a payment token is valid
+     * @param {string} paymentTokenId - Square payment token to verify
+     * @returns {Promise} Response with validation status
+     */
+    verifyToken: async (paymentTokenId) => {
+        const response = await apiClient.post(config.ENDPOINTS.PAYMENT.VERIFY_TOKEN, {
+            paymentTokenId
         });
         return response.data;
     }

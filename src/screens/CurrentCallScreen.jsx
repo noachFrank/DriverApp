@@ -31,45 +31,73 @@ import {
     ScrollView,
     ActivityIndicator,
     Linking,
-    Alert,
     Modal,
-    Platform
+    Platform,
+    TextInput
 } from 'react-native';
 import { ridesAPI } from '../services/apiService';
 import signalRService from '../services/signalRService';
 import locationTrackingService from '../services/locationTrackingService';
+import { openAddressInMaps } from '../services/mapsService';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAuth } from '../contexts/AuthContext';
 import { useWaitTime } from '../contexts/WaitTimeContext';
+import { useAlert } from '../contexts/AlertContext';
 import PaymentScreen from './PaymentScreen';
-import { formatDayLabel, formatEstimatedDuration } from '../utils/dateHelpers';
+import { formatDate, formatDayLabel, formatEstimatedDuration, formatTimeOnly } from '../utils/dateHelpers';
 import AddressAutocomplete from '../components/AddressAutocomplete';
 
 const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
     // All hooks at the top
     const { theme } = useTheme();
+    const { user } = useAuth();
+    const { showAlert, showToast } = useAlert();
     const colors = theme?.colors || {};
     const {
         isTimerRunning,
         formattedTime,
+        formattedBillableTime,
+        formattedFreeTimeRemaining,
         waitTimeMinutes,
-        startTimer,
-        stopTimer,
-        resetTimer
+        activeRideId,
+        timerState,
+        currentLocation,
+        isInFreeWait,
+        startAtPickup,
+        startAtStop,
+        pauseTimer,
+        resumeTimer,
+        resetTimer,
+        markPickedUp,
+        markStopComplete,
+        clearTimer,
+        canControlTimer,
+        hasAccumulatedTime,
+        getWaitTimeForRide,
+        isTimerActiveForRide,
+        wasTimerStartedForRide,
     } = useWaitTime();
 
     const [call, setCall] = useState(null);
     const [loading, setLoading] = useState(true);
     const [actionLoading, setActionLoading] = useState(false);
-    const [showCancelModal, setShowCancelModal] = useState(false);
-    const [rideStatus, setRideStatus] = useState('assigned');
+    const [showRequestModal, setShowRequestModal] = useState(false);
+    const [rideStatus, setRideStatus] = useState('assigned'); // 'assigned' | 'atPickup' | 'pickedUp' | 'atStopX' | 'completedStopX'
     const [currentStopIndex, setCurrentStopIndex] = useState(0);
+    const [isAtCurrentStop, setIsAtCurrentStop] = useState(false); // Are we currently waiting at a stop?
     const [showPayment, setShowPayment] = useState(false);
+    const [finalWaitTimeMinutes, setFinalWaitTimeMinutes] = useState(0); // Store wait time before clearing timer
 
     // State for adding stops feature
     const [showAddStopForm, setShowAddStopForm] = useState(false);
     const [pendingStops, setPendingStops] = useState([]); // Array of validated addresses
     const [currentStopInput, setCurrentStopInput] = useState('');
     const [confirmingStops, setConfirmingStops] = useState(false);
+
+    // State for cancel/reassign reason modal
+    const [showReasonModal, setShowReasonModal] = useState(false);
+    const [pendingAction, setPendingAction] = useState(null); // 'cancel' or 'reassign'
+    const [reasonText, setReasonText] = useState('');
 
     // Fetch call details on mount
     useEffect(() => {
@@ -86,7 +114,7 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                 }
             } catch (error) {
                 console.error('Error fetching call details:', error);
-                Alert.alert('Error', 'Failed to load call details');
+                showAlert('Error', 'Failed to load call details', [{ text: 'OK' }]);
             } finally {
                 setLoading(false);
             }
@@ -97,10 +125,43 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         // Cleanup: don't stop tracking here
     }, [rideId]);
 
-    /**
-     * Opens the phone app with the given phone number
-     * Uses the tel: URL scheme which works on both iOS and Android
-     */
+    // Listen for pickup time reset from dispatcher
+    useEffect(() => {
+        const unsubscribe = signalRService.onPickupTimeReset((data) => {
+            console.log('Pickup time reset received:', data);
+            // Only handle if it's for this ride
+            if (data.rideId === rideId) {
+                showAlert(
+                    'Pickup Time Reset',
+                    data.message || 'The pickup time for this ride has been reset by dispatch. Please pick up the customer again.',
+                    [
+                        {
+                            text: 'OK',
+                            onPress: async () => {
+                                // Reset the ride status back to assigned
+                                setRideStatus('assigned');
+                                setCurrentStopIndex(0);
+                                setIsAtCurrentStop(false);
+
+                                // Refresh the call data
+                                try {
+                                    const data = await ridesAPI.getById(rideId);
+                                    setCall(data);
+                                } catch (error) {
+                                    console.error('Error refreshing call details:', error);
+                                }
+                            }
+                        }
+                    ]
+                );
+            }
+        });
+
+        return () => {
+            if (unsubscribe) unsubscribe();
+        };
+    }, [rideId, showAlert]);
+
     const handlePhonePress = (phoneNumber) => {
         if (!phoneNumber) return;
 
@@ -113,49 +174,20 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                 if (supported) {
                     Linking.openURL(url);
                 } else {
-                    Alert.alert('Error', 'Phone calls are not supported on this device');
+                    showAlert('Error', 'Phone calls are not supported on this device', [{ text: 'OK' }]);
                 }
             })
             .catch((err) => console.error('Error opening phone:', err));
     };
 
-    /**
-     * Opens the maps app with the given address for navigation
-     * Uses different URL schemes for iOS (Apple Maps) and Android (Google Maps)
-     */
     const handleAddressPress = (address) => {
         if (!address) return;
-
-        const encodedAddress = encodeURIComponent(address);
-
-        // Use platform-specific maps URL
-        const url = Platform.select({
-            ios: `maps:0,0?q=${encodedAddress}`,
-            android: `geo:0,0?q=${encodedAddress}`
-        });
-
-        Linking.canOpenURL(url)
-            .then((supported) => {
-                if (supported) {
-                    Linking.openURL(url);
-                } else {
-                    // Fallback to Google Maps web URL
-                    Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodedAddress}`);
-                }
-            })
-            .catch((err) => {
-                console.error('Error opening maps:', err);
-                // Fallback to Google Maps web URL
-                Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodedAddress}`);
-            });
+        openAddressInMaps(address);
     };
 
     // Maximum number of stops allowed per ride
     const MAX_STOPS = 10;
 
-    /**
-     * Get list of stops that exist for this ride
-     */
     const getStops = () => {
         const stops = [];
         if (call?.route?.stop1) stops.push({ index: 1, address: call.route.stop1 });
@@ -171,62 +203,62 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         return stops;
     };
 
-    /**
-     * Get total number of stops (existing + pending)
-     */
     const getTotalStopsCount = () => {
         return getStops().length + pendingStops.length;
     };
 
-    /**
-     * Get number of existing stops on the ride
-     */
     const getExistingStopsCount = () => {
         return getStops().length;
     };
 
-    /**
-     * Handle the "Picked Up" button press
-     * Calls /api/Ride/PickUp and advances to next stage
-     */
     const handlePickedUp = async () => {
         setActionLoading(true);
         try {
             console.log('Picking up ride:', rideId);
+
+            // Mark wait time as locked (can no longer be reset)
+            markPickedUp(rideId);
+
             await ridesAPI.pickup(rideId);
             setRideStatus('pickedUp');
             setCurrentStopIndex(0);
         } catch (error) {
             console.error('Error picking up:', error);
-            Alert.alert('Error', 'Failed to mark as picked up. Please try again.');
+            showAlert('Error', 'Failed to mark as picked up. Please try again.', [{ text: 'OK' }]);
         } finally {
             setActionLoading(false);
         }
     };
 
-    /**
-     * Handle stop button press
-     * Advances to next stop or to dropoff if no more stops
-     */
     const handleStopComplete = () => {
         const stops = getStops();
+        const currentStop = stops[currentStopIndex];
+
+        // Mark this stop complete in the wait time context
+        markStopComplete(rideId, currentStop?.index || currentStopIndex + 1);
+
+        // Reset the "at stop" state
+        setIsAtCurrentStop(false);
+
+        // Advance to next stop
         const nextIndex = currentStopIndex + 1;
         if (nextIndex <= stops.length) {
             setCurrentStopIndex(nextIndex);
         }
     };
 
-    /**
-     * Handle the "Drop Off" button press
-     * Calls /api/Ride/DroppedOff and shows payment screen
-     */
     const handleDropOff = async () => {
         setActionLoading(true);
         try {
             console.log('Dropping off ride:', rideId);
 
-            // Stop the wait time timer when dropping off
-            stopTimer();
+            // Get the wait time for this ride before clearing and store it
+            const finalWaitTime = getWaitTimeForRide(rideId);
+            console.log(`⏱️ Final wait time for ride ${rideId}: ${finalWaitTime} minutes`);
+            setFinalWaitTimeMinutes(finalWaitTime); // Store for payment screen
+
+            // Clear the timer when dropping off
+            clearTimer(rideId);
 
             await ridesAPI.dropoff(rideId);
 
@@ -242,15 +274,12 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
             setShowPayment(true);
         } catch (error) {
             console.error('Error dropping off:', error);
-            Alert.alert('Error', 'Failed to mark as dropped off. Please try again.');
+            showAlert('Error', 'Failed to mark as dropped off. Please try again.', [{ text: 'OK' }]);
         } finally {
             setActionLoading(false);
         }
     };
 
-    /**
-     * Handle payment completion - return to previous screen
-     */
     const handlePaymentComplete = () => {
         setShowPayment(false);
         if (onBack) {
@@ -258,13 +287,46 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         }
     };
 
-    /**
-     * Get the current action button based on ride status
-     */
+    const isWaitTimeActiveForThisRide = isTimerActiveForRide(rideId);
+
+    const handleAtStop = (stopNumber) => {
+        setActionLoading(true);
+        try {
+            console.log(`At Stop ${stopNumber} for ride:`, rideId);
+            startAtStop(rideId, stopNumber);
+            setIsAtCurrentStop(true);
+        } finally {
+            setActionLoading(false);
+        }
+    };
+
     const getActionButton = () => {
         const stops = getStops();
 
         if (rideStatus === 'assigned') {
+            // Check if timer is already active (At Pickup was clicked)
+            const timerActiveAtPickup = isTimerActiveForRide(rideId) && currentLocation === 'pickup';
+
+            if (!timerActiveAtPickup) {
+                // At Pickup not clicked yet - show "At Pickup" button
+                if (!canControlTimer(rideId)) {
+                    // Timer active for another ride - show disabled At Pickup
+                    return {
+                        label: '📍 At Pickup',
+                        onPress: () => { },
+                        style: styles.atPickupButtonDisabledBottom,
+                        textStyle: styles.atPickupButtonTextDisabled,
+                        disabled: true
+                    };
+                }
+                return {
+                    label: '📍 At Pickup',
+                    onPress: () => startAtPickup(rideId),
+                    style: styles.atPickupButtonBottom,
+                    textStyle: styles.atPickupButtonTextBottom
+                };
+            }
+            // Timer is active at pickup, show "Picked Up" button
             return {
                 label: 'Picked Up',
                 onPress: handlePickedUp,
@@ -274,15 +336,30 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         }
 
         if (rideStatus === 'pickedUp') {
+            // Check if there are stops to process
             if (currentStopIndex < stops.length) {
                 const nextStop = stops[currentStopIndex];
-                return {
-                    label: `Stop #${nextStop.index}`,
-                    onPress: handleStopComplete,
-                    style: styles.stopButton,
-                    textStyle: styles.stopButtonText
-                };
+
+                // Check if we're at the current stop (waiting)
+                if (isAtCurrentStop) {
+                    // We're at the stop, show "Stop X" to mark complete
+                    return {
+                        label: `Stop ${nextStop.index}`,
+                        onPress: handleStopComplete,
+                        style: styles.stopButton,
+                        textStyle: styles.stopButtonText
+                    };
+                } else {
+                    // Not at stop yet, show "At Stop X" button
+                    return {
+                        label: `📍 At Stop ${nextStop.index}`,
+                        onPress: () => handleAtStop(nextStop.index),
+                        style: styles.atStopButton,
+                        textStyle: styles.atStopButtonText
+                    };
+                }
             } else {
+                // No more stops, show Drop Off
                 return {
                     label: 'Drop Off',
                     onPress: handleDropOff,
@@ -295,75 +372,83 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         return null;
     };
 
-    /**
-     * Show cancel options modal
-     */
-    const handleCancelPress = () => {
-        setShowCancelModal(true);
+    const handleRequestPress = () => {
+        setShowRequestModal(true);
     };
 
-    /**
-     * Handle cancel ride option
-     * Sends message to dispatcher and shows confirmation
-     */
-    const handleCancelRide = async () => {
-        setShowCancelModal(false);
-        try {
-            await signalRService.sendMessageToDispatchers(
-                `Cancel Ride Request: RideId ${rideId}`,
-                rideId
-            );
-            Alert.alert(
-                'Request Sent',
-                'The dispatcher has been notified of your cancel request and will handle it shortly.'
-            );
-        } catch (error) {
-            console.error('Error sending cancel ride message:', error);
-            Alert.alert(
-                'Request Sent',
-                'The dispatcher has been notified of your cancel request and will handle it shortly.'
-            );
+    const handleCancelRideOption = () => {
+        setShowRequestModal(false);
+        setPendingAction('cancel');
+        setReasonText('');
+        setShowReasonModal(true);
+    };
+
+    const handleCancelDriverOption = () => {
+        setShowRequestModal(false);
+        setPendingAction('reassign');
+        setReasonText('');
+        setShowReasonModal(true);
+    };
+
+    const handleResetPickupOption = () => {
+        setShowRequestModal(false);
+        setPendingAction('resetPickup');
+        setReasonText('');
+        setShowReasonModal(true);
+    };
+
+    const handleSubmitReason = async () => {
+        if (!reasonText.trim()) {
+            showToast('Please enter a reason', 'error');
+            return;
         }
-    };
 
-    /**
-     * Handle cancel driver option (reassign)
-     * Sends message to dispatcher and shows confirmation
-     */
-    const handleCancelDriver = async () => {
-        setShowCancelModal(false);
+        setShowReasonModal(false);
         try {
-            await signalRService.sendMessageToDispatchers(
-                `Reassign Ride Request: RideId ${rideId}`,
-                rideId
-            );
-            Alert.alert(
-                'Request Sent',
-                'The dispatcher has been notified of your reassign request and will handle it shortly.'
-            );
+            if (pendingAction === 'cancel') {
+                await signalRService.sendMessageToDispatchers(
+                    `Cancel Ride Request: RideId ${rideId}\nReason: ${reasonText.trim()}`,
+                    rideId,
+                    user?.name
+                );
+                showToast('Dispatcher notified of your cancel request', 'success');
+            } else if (pendingAction === 'reassign') {
+                await signalRService.sendMessageToDispatchers(
+                    `Reassign Ride Request: RideId ${rideId}\nReason: ${reasonText.trim()}`,
+                    rideId,
+                    user?.name
+                );
+                showToast('Dispatcher notified of your reassign request', 'success');
+            } else if (pendingAction === 'resetPickup') {
+                await signalRService.sendMessageToDispatchers(
+                    `Reset Pickup Request: RideId ${rideId}\nReason: ${reasonText.trim()}`,
+                    rideId,
+                    user?.name
+                );
+                showToast('Dispatcher notified of your reset pickup request', 'success');
+            }
         } catch (error) {
-            console.error('Error sending reassign ride message:', error);
-            Alert.alert(
-                'Request Sent',
-                'The dispatcher has been notified of your reassign request and will handle it shortly.'
-            );
+            console.error('Error sending request message:', error);
+            showToast('Request sent', 'success');
         }
+        setPendingAction(null);
+        setReasonText('');
     };
 
-    /**
-     * Handle address selection from the AddressAutocomplete component
-     * When user selects a validated address from Google Places, add it to pending stops
-     * 
-     * @param {string} formattedAddress - The validated formatted address from Google
-     * @param {object} placeDetails - Additional place details (placeId, lat, lng)
-     */
+    const handleCloseReasonModal = () => {
+        setShowReasonModal(false);
+        setPendingAction(null);
+        setReasonText('');
+    };
+
     const handleAddressSelected = (formattedAddress, placeDetails) => {
         if (formattedAddress && formattedAddress.trim()) {
             // Check if we've hit the maximum number of stops
             if (getTotalStopsCount() >= MAX_STOPS) {
-                Alert.alert(
+                showAlert(
                     'Maximum Stops Reached',
-                    `You cannot have more than ${MAX_STOPS} stops. Please remove some stops before adding more.`
+                    `You cannot have more than ${MAX_STOPS} stops. Please remove some stops before adding more.`,
+                    [{ text: 'OK' }]
                 );
                 setCurrentStopInput('');
                 return;
@@ -379,30 +464,13 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
         }
     };
 
-    /**
-     * Remove a pending stop from the list
-     * Called when user taps the X button on a pending stop
-     * 
-     * @param {number} index - Index of the stop to remove
-     */
     const handleRemovePendingStop = (index) => {
         setPendingStops(prev => prev.filter((_, i) => i !== index));
     };
 
-    /**
-     * Confirm and submit all pending stops
-     * 
-     * This function:
-     * 1. Loops through all pending stops
-     * 2. Calls /api/Ride/AddStop for each stop
-     * 3. Calculates a price adjustment (adds $5 per stop - adjust as needed)
-     * 4. Calls /api/Ride/UpdatePrice with the new total
-     * 5. Refreshes the call data to show the new stops
-     * 6. Clears the pending stops and hides the form
-     */
     const handleConfirmStops = async () => {
         if (pendingStops.length === 0) {
-            Alert.alert('No Stops', 'Please add at least one stop before confirming.');
+            showAlert('No Stops', 'Please add at least one stop before confirming.', [{ text: 'OK' }]);
             return;
         }
 
@@ -433,24 +501,19 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
             setShowAddStopForm(false);
             setCurrentStopInput('');
 
-            Alert.alert(
-                'Stops Added',
-                `Successfully added ${pendingStops.length} stop(s). Price updated to $${newPrice.toFixed(2)}.`
-            );
+            showToast(`Added ${pendingStops.length} stop(s). Price updated to $${newPrice.toFixed(2)}`, 'success');
         } catch (error) {
             console.error('Error adding stops:', error);
-            Alert.alert(
+            showAlert(
                 'Error',
-                'Failed to add stops. Please try again.'
+                'Failed to add stops. Please try again.',
+                [{ text: 'OK' }]
             );
         } finally {
             setConfirmingStops(false);
         }
     };
 
-    /**
-     * Cancel adding stops - clear pending and hide form
-     */
     const handleCancelAddStops = () => {
         setPendingStops([]);
         setCurrentStopInput('');
@@ -494,6 +557,49 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                     <View style={styles.headerSpacer} />
                 </View>
 
+                {/* Floating Wait Time Timer - Top Right Corner */}
+                {isWaitTimeActiveForThisRide && (
+                    <View style={styles.floatingWaitTimeContainer}>
+                        <View style={[
+                            styles.floatingWaitTime,
+                            { backgroundColor: isInFreeWait ? '#27ae60' : (isTimerRunning ? '#e74c3c' : '#f39c12') }
+                        ]}>
+                            <Text style={styles.floatingWaitTimeLabel}>
+                                {isInFreeWait ? '🆓 FREE' : '⏱️ WAIT'}
+                            </Text>
+                            <Text style={styles.floatingWaitTimeValue}>{formattedTime}</Text>
+                            {!isInFreeWait && waitTimeMinutes > 0 && (
+                                <Text style={styles.floatingWaitTimeBillable}>
+                                    ${(waitTimeMinutes * 0.50).toFixed(2)}+
+                                </Text>
+                            )}
+                            <View style={styles.floatingWaitTimeButtons}>
+                                {isTimerRunning ? (
+                                    <TouchableOpacity
+                                        style={styles.floatingWaitTimeBtn}
+                                        onPress={() => pauseTimer(rideId)}
+                                    >
+                                        <Text style={styles.floatingWaitTimeBtnText}>⏸</Text>
+                                    </TouchableOpacity>
+                                ) : (
+                                    <TouchableOpacity
+                                        style={styles.floatingWaitTimeBtn}
+                                        onPress={() => resumeTimer(rideId)}
+                                    >
+                                        <Text style={styles.floatingWaitTimeBtnText}>▶</Text>
+                                    </TouchableOpacity>
+                                )}
+                                <TouchableOpacity
+                                    style={[styles.floatingWaitTimeBtn, styles.floatingWaitTimeResetBtn]}
+                                    onPress={() => resetTimer(rideId)}
+                                >
+                                    <Text style={styles.floatingWaitTimeBtnText}>↺</Text>
+                                </TouchableOpacity>
+                            </View>
+                        </View>
+                    </View>
+                )}
+
                 <ScrollView style={styles.scrollContainer} contentContainerStyle={styles.scrollContent}>
                     {/* Customer Info Section */}
                     <View style={[styles.section, { backgroundColor: colors.card }]}>
@@ -510,6 +616,33 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                                 {call.customerPhoneNumber || 'No phone'}
                             </Text>
                         </TouchableOpacity>
+
+                        {/* Flight Number - only show if it has a value */}
+                        {call.flightNumber && (
+                            <View style={styles.flightNumberBanner}>
+                                <Text style={styles.flightNumberBannerText}>✈️ Flight # {call.flightNumber}</Text>
+                            </View>
+                        )}
+
+                        {/* Recurring Ride Banner */}
+                        {call.isRecurring && (
+                            <View style={styles.recurringBanner}>
+                                <Text style={styles.recurringBannerTitle}>🔁 RECURRING RIDE</Text>
+                                {call.recurring && (
+                                    <Text style={styles.recurringBannerDetails}>
+                                        {['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][call.recurring.dayOfWeek]} at {formatTimeOnly(call.recurring.time)} until {formatDate(call.recurring.endDate)}
+                                    </Text>
+                                )}
+                            </View>
+                        )}
+
+                        {/* Car Seat Indicator */}
+                        {call.carSeat && (
+                            <View style={styles.carSeatBanner}>
+                                <Text style={styles.carSeatBannerText}>🚼 Car Seat Required</Text>
+                            </View>
+                        )}
+
                     </View>
 
                     {/* Route Section */}
@@ -724,9 +857,10 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                                     style={[styles.addStopToggleButton, { backgroundColor: getExistingStopsCount() >= MAX_STOPS ? '#ccc' : (colors.primary || '#007AFF') }]}
                                     onPress={() => {
                                         if (getExistingStopsCount() >= MAX_STOPS) {
-                                            Alert.alert(
+                                            showAlert(
                                                 'Maximum Stops Reached',
-                                                `This ride already has ${MAX_STOPS} stops. You cannot add more stops.`
+                                                `This ride already has ${MAX_STOPS} stops. You cannot add more stops.`,
+                                                [{ text: 'OK' }]
                                             );
                                         } else {
                                             setShowAddStopForm(true);
@@ -812,14 +946,14 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                         <View style={styles.detailRow}>
                             <Text style={[styles.detailLabel, { color: colors.textSecondary }]}>Call Time:</Text>
                             <Text style={[styles.detailValue, { color: colors.text }]}>
-                                {call.callTime ? `${formatDayLabel(call.scheduledFor)} ${new Date(call.callTime).toLocaleString([], { hour: '2-digit', minute: '2-digit' })}` : 'N/A'}
+                                {call.callTime ? `${formatDayLabel(call.scheduledFor)} ${formatDate(call.callTime)}` : 'N/A'}
                             </Text>
                         </View>
 
                         <View style={styles.detailRow}>
                             <Text style={[styles.detailLabel, { color: colors.textSecondary }]}>Scheduled For:</Text>
                             <Text style={[styles.detailValue, { color: colors.text }]}>
-                                {call.scheduledFor ? `${formatDayLabel(call.scheduledFor)} ${new Date(call.scheduledFor).toLocaleString([], { hour: '2-digit', minute: '2-digit' })}` : 'N/A'}
+                                {call.scheduledFor ? `${formatDayLabel(call.scheduledFor)} ${formatDate(call.scheduledFor)}` : 'N/A'}
                             </Text>
                         </View>
 
@@ -830,11 +964,11 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                             </Text>
                         </View>
 
-                        {formatEstimatedDuration(call.estimatedDuration) && (
+                        {formatEstimatedDuration(call.route?.estimatedDuration) && (
                             <View style={styles.detailRow}>
                                 <Text style={[styles.detailLabel, { color: colors.textSecondary }]}>Trip Duration:</Text>
                                 <Text style={[styles.tripDurationValue, { color: colors.primary }]}>
-                                    🕐 {formatEstimatedDuration(call.estimatedDuration)}
+                                    🕐 {formatEstimatedDuration(call.route?.estimatedDuration)}
                                 </Text>
                             </View>
                         )}
@@ -852,74 +986,38 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                         )}
                     </View>
 
-                    {/* Wait Time Timer Section - Always visible */}
-                    <View style={[styles.section, styles.timerSection, { backgroundColor: colors.card }]}>
-                        <Text style={[styles.sectionTitle, { color: colors.textSecondary }]}>⏱️ Wait Time</Text>
-
-                        <View style={styles.timerDisplay}>
-                            <Text style={[styles.timerValue, { color: colors.text }]}>
-                                {formattedTime}
-                            </Text>
-                            {waitTimeMinutes > 0 && (
-                                <Text style={[styles.timerMinutes, { color: colors.textSecondary }]}>
-                                    ({waitTimeMinutes} min)
+                    {/* Show locked wait time indicator after pickup (if there was wait time) */}
+                    {rideStatus === 'pickedUp' && hasAccumulatedTime(rideId) && (
+                        <View style={[styles.section, { backgroundColor: colors.card }]}>
+                            <View style={styles.lockedWaitTimeRow}>
+                                <Text style={[styles.lockedWaitTimeLabel, { color: colors.textSecondary }]}>⏱️ Wait Time Recorded:</Text>
+                                <Text style={[styles.lockedWaitTimeValue, { color: '#2ecc71' }]}>
+                                    {formattedTime} ({waitTimeMinutes} min)
                                 </Text>
-                            )}
+                            </View>
                         </View>
-
-                        <View style={styles.timerButtons}>
-                            {!isTimerRunning ? (
-                                <TouchableOpacity
-                                    style={[styles.timerStartButton, { backgroundColor: '#2ecc71' }]}
-                                    onPress={() => startTimer(rideId)}
-                                >
-                                    <Text style={styles.timerButtonText}>▶ Start</Text>
-                                </TouchableOpacity>
-                            ) : (
-                                <TouchableOpacity
-                                    style={[styles.timerStopButton, { backgroundColor: '#e74c3c' }]}
-                                    onPress={stopTimer}
-                                >
-                                    <Text style={styles.timerButtonText}>⏸ Stop</Text>
-                                </TouchableOpacity>
-                            )}
-
-                            {/* Reset button - only shown in CurrentCallScreen */}
-                            {waitTimeMinutes > 0 && !isTimerRunning && (
-                                <TouchableOpacity
-                                    style={[styles.timerResetButton, { borderColor: colors.divider }]}
-                                    onPress={resetTimer}
-                                >
-                                    <Text style={[styles.timerResetText, { color: colors.textSecondary }]}>Reset</Text>
-                                </TouchableOpacity>
-                            )}
-                        </View>
-
-                        <Text style={[styles.timerHint, { color: colors.textMuted }]}>
-                            Use this timer to track customer wait time. Charges will be added at $1/min.
-                        </Text>
-                    </View>
+                    )}
                 </ScrollView>
 
                 {/* Bottom Action Buttons */}
                 {!showPayment && (
                     <View style={[styles.actionButtons, { backgroundColor: colors.card, borderTopColor: colors.divider }]}>
-                        {/* Only show cancel button before pickup */}
-                        {rideStatus === 'assigned' && (
+                        {/* Show request button before dropoff */}
+                        {!call?.dropOffTime && (
                             <TouchableOpacity
                                 style={styles.cancelButton}
-                                onPress={handleCancelPress}
+                                onPress={handleRequestPress}
                                 disabled={actionLoading}
                             >
-                                <Text style={styles.cancelButtonText}>Cancel</Text>
+                                <Text style={styles.cancelButtonText}>Request</Text>
                             </TouchableOpacity>
                         )}
 
                         {getActionButton() && (
                             <TouchableOpacity
-                                style={[getActionButton().style, actionLoading && styles.disabledButton]}
+                                style={[getActionButton().style, (actionLoading || getActionButton().disabled) && styles.disabledButton]}
                                 onPress={getActionButton().onPress}
-                                disabled={actionLoading}
+                                disabled={actionLoading || getActionButton().disabled}
                             >
                                 {actionLoading ? (
                                     <ActivityIndicator size="small" color="#fff" />
@@ -949,58 +1047,129 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                             cost={call?.cost}
                             paymentType={call?.paymentType}
                             call={call}
-                            waitTimeMinutes={waitTimeMinutes}
+                            waitTimeMinutes={finalWaitTimeMinutes}
                             onComplete={handlePaymentComplete}
                         />
                     </View>
                 )}
 
-                {/* Cancel Options Modal */}
+                {/* Request Options Modal */}
                 <Modal
-                    visible={showCancelModal}
+                    visible={showRequestModal}
                     transparent={true}
                     animationType="fade"
-                    onRequestClose={() => setShowCancelModal(false)}
+                    onRequestClose={() => setShowRequestModal(false)}
                 >
                     <View style={styles.modalOverlay}>
                         <View style={[styles.modalContent, { backgroundColor: colors.card }]}>
-                            <Text style={[styles.modalTitle, { color: colors.text }]}>Cancel Options</Text>
+                            <Text style={[styles.modalTitle, { color: colors.text }]}>Request Options</Text>
                             <Text style={[styles.modalSubtitle, { color: colors.textSecondary }]}>
-                                What would you like to cancel?
+                                What would you like to request?
                             </Text>
-
+                            {console.log(call)}
                             <TouchableOpacity
                                 style={[styles.modalOption, { backgroundColor: colors.background }]}
-                                onPress={handleCancelRide}
+                                onPress={handleCancelRideOption}
                             >
                                 <Text style={styles.modalOptionIcon}>🚫</Text>
                                 <View style={styles.modalOptionContent}>
                                     <Text style={[styles.modalOptionTitle, { color: colors.text }]}>Cancel Ride</Text>
                                     <Text style={[styles.modalOptionDesc, { color: colors.textSecondary }]}>
-                                        Cancel the entire ride for the customer
+                                        Request to cancel the entire ride
                                     </Text>
                                 </View>
                             </TouchableOpacity>
 
                             <TouchableOpacity
                                 style={[styles.modalOption, { backgroundColor: colors.background }]}
-                                onPress={handleCancelDriver}
+                                onPress={handleCancelDriverOption}
                             >
                                 <Text style={styles.modalOptionIcon}>🔄</Text>
                                 <View style={styles.modalOptionContent}>
                                     <Text style={[styles.modalOptionTitle, { color: colors.text }]}>Reassign Call</Text>
                                     <Text style={[styles.modalOptionDesc, { color: colors.textSecondary }]}>
-                                        Release this call so another driver can take it
+                                        Request to release this call to another driver
                                     </Text>
                                 </View>
                             </TouchableOpacity>
 
+                            {rideStatus !== 'assigned' && (
+                                <TouchableOpacity
+                                    style={[styles.modalOption, { backgroundColor: colors.background }]}
+                                    onPress={handleResetPickupOption}
+                                >
+                                    <Text style={styles.modalOptionIcon}>↩️</Text>
+                                    <View style={styles.modalOptionContent}>
+                                        <Text style={[styles.modalOptionTitle, { color: colors.text }]}>Reset Pickup</Text>
+                                        <Text style={[styles.modalOptionDesc, { color: colors.textSecondary }]}>
+                                            Request to reset pickup time
+                                        </Text>
+                                    </View>
+                                </TouchableOpacity>
+                            )}
+
                             <TouchableOpacity
                                 style={[styles.modalCancelButton, { borderTopColor: colors.divider }]}
-                                onPress={() => setShowCancelModal(false)}
+                                onPress={() => setShowRequestModal(false)}
                             >
                                 <Text style={[styles.modalCancelText, { color: colors.primary }]}>Close</Text>
                             </TouchableOpacity>
+                        </View>
+                    </View>
+                </Modal>
+
+                {/* Reason Input Modal */}
+                <Modal
+                    visible={showReasonModal}
+                    transparent={true}
+                    animationType="fade"
+                    onRequestClose={handleCloseReasonModal}
+                >
+                    <View style={styles.modalOverlay}>
+                        <View style={[styles.modalContent, { backgroundColor: colors.card }]}>
+                            <Text style={[styles.modalTitle, { color: colors.text }]}>
+                                {pendingAction === 'cancel' ? 'Cancel Ride' : pendingAction === 'resetPickup' ? 'Reset Pickup' : 'Reassign Call'}
+                            </Text>
+                            <Text style={[styles.modalSubtitle, { color: colors.textSecondary }]}>
+                                Please provide a reason for this request (required)
+                            </Text>
+
+                            <TextInput
+                                style={[
+                                    styles.reasonInput,
+                                    {
+                                        backgroundColor: colors.background,
+                                        color: colors.text,
+                                        borderColor: colors.divider
+                                    }
+                                ]}
+                                placeholder="Enter reason..."
+                                placeholderTextColor={colors.textSecondary}
+                                value={reasonText}
+                                onChangeText={setReasonText}
+                                multiline={true}
+                                numberOfLines={3}
+                                textAlignVertical="top"
+                            />
+
+                            <View style={styles.reasonButtonRow}>
+                                <TouchableOpacity
+                                    style={[styles.reasonButton, styles.reasonCancelButton, { borderColor: colors.divider }]}
+                                    onPress={handleCloseReasonModal}
+                                >
+                                    <Text style={[styles.reasonButtonText, { color: colors.textSecondary }]}>Cancel</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                    style={[
+                                        styles.reasonButton,
+                                        styles.reasonSubmitButton,
+                                        { backgroundColor: pendingAction === 'cancel' ? '#dc3545' : colors.primary }
+                                    ]}
+                                    onPress={handleSubmitReason}
+                                >
+                                    <Text style={[styles.reasonButtonText, { color: '#fff' }]}>Submit</Text>
+                                </TouchableOpacity>
+                            </View>
                         </View>
                     </View>
                 </Modal>
@@ -1113,6 +1282,36 @@ const styles = StyleSheet.create({
         fontWeight: '700',
         color: '#333',
         marginBottom: 10,
+    },
+    carSeatBanner: {
+        backgroundColor: '#ffb4b4ff',
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        borderRadius: 8,
+        marginBottom: 12,
+        borderWidth: 2,
+        borderColor: '#ff0000ff',
+        alignItems: 'center',
+    },
+    carSeatBannerText: {
+        fontSize: 16,
+        fontWeight: '700',
+        color: '#d21e1eff',
+    },
+    flightNumberBanner: {
+        backgroundColor: '#b4ffb4',
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        borderRadius: 8,
+        marginBottom: 12,
+        borderWidth: 2,
+        borderColor: '#00cc00',
+        alignItems: 'center',
+    },
+    flightNumberBannerText: {
+        fontSize: 16,
+        fontWeight: '700',
+        color: '#008000',
     },
     phoneButton: {
         flexDirection: 'row',
@@ -1256,6 +1455,18 @@ const styles = StyleSheet.create({
         fontSize: 18,
         fontWeight: '600',
     },
+    atStopButton: {
+        flex: 2,
+        backgroundColor: '#e67e22',
+        paddingVertical: 15,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    atStopButtonText: {
+        color: '#fff',
+        fontSize: 18,
+        fontWeight: '700',
+    },
     dropoffButton: {
         flex: 2,
         backgroundColor: '#9b59b6',
@@ -1344,6 +1555,37 @@ const styles = StyleSheet.create({
         fontSize: 16,
         color: '#007AFF',
         fontWeight: '500',
+    },
+    // Reason Input Modal Styles
+    reasonInput: {
+        borderWidth: 1,
+        borderRadius: 10,
+        padding: 12,
+        fontSize: 16,
+        minHeight: 100,
+        marginBottom: 15,
+    },
+    reasonButtonRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        gap: 10,
+    },
+    reasonButton: {
+        flex: 1,
+        padding: 14,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    reasonCancelButton: {
+        borderWidth: 1,
+        backgroundColor: 'transparent',
+    },
+    reasonSubmitButton: {
+        backgroundColor: '#007AFF',
+    },
+    reasonButtonText: {
+        fontSize: 16,
+        fontWeight: '600',
     },
     paymentFullScreen: {
         position: 'absolute',
@@ -1489,6 +1731,155 @@ const styles = StyleSheet.create({
         fontSize: 12,
         textAlign: 'center',
         fontStyle: 'italic',
+    },
+    // At Pickup button styles (legacy - can be removed)
+    atPickupButton: {
+        paddingHorizontal: 40,
+        paddingVertical: 16,
+        borderRadius: 30,
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginVertical: 10,
+    },
+    atPickupButtonDisabled: {
+        opacity: 0.5,
+    },
+    atPickupButtonText: {
+        color: '#fff',
+        fontSize: 20,
+        fontWeight: '700',
+    },
+    disabledAtPickupContainer: {
+        alignItems: 'center',
+        paddingVertical: 10,
+    },
+    disabledAtPickupText: {
+        fontSize: 14,
+        textAlign: 'center',
+        marginBottom: 10,
+    },
+    // At Pickup button in bottom action bar
+    atPickupButtonBottom: {
+        flex: 1,
+        backgroundColor: '#3498db',
+        paddingVertical: 15,
+        borderRadius: 10,
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginHorizontal: 5,
+    },
+    atPickupButtonTextBottom: {
+        color: '#fff',
+        fontSize: 18,
+        fontWeight: '700',
+    },
+    atPickupButtonDisabledBottom: {
+        flex: 1,
+        backgroundColor: '#bdc3c7',
+        paddingVertical: 15,
+        borderRadius: 10,
+        alignItems: 'center',
+        justifyContent: 'center',
+        marginHorizontal: 5,
+    },
+    atPickupButtonTextDisabled: {
+        color: '#7f8c8d',
+        fontSize: 18,
+        fontWeight: '700',
+    },
+    // Floating Wait Time Timer (top right corner)
+    floatingWaitTimeContainer: {
+        position: 'absolute',
+        top: 60,
+        right: 10,
+        zIndex: 100,
+    },
+    floatingWaitTime: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        borderRadius: 20,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.3,
+        shadowRadius: 4,
+        elevation: 6,
+    },
+    floatingWaitTimeLabel: {
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: '700',
+        marginRight: 6,
+    },
+    floatingWaitTimeValue: {
+        color: '#fff',
+        fontSize: 18,
+        fontWeight: '800',
+        fontVariant: ['tabular-nums'],
+        marginRight: 8,
+    },
+    floatingWaitTimeBillable: {
+        color: '#fff',
+        fontSize: 10,
+        fontWeight: '600',
+        marginRight: 6,
+        opacity: 0.9,
+    },
+    floatingWaitTimeButtons: {
+        flexDirection: 'row',
+        gap: 4,
+    },
+    floatingWaitTimeBtn: {
+        width: 26,
+        height: 26,
+        borderRadius: 13,
+        backgroundColor: 'rgba(255,255,255,0.3)',
+        justifyContent: 'center',
+        alignItems: 'center',
+    },
+    floatingWaitTimeResetBtn: {
+        backgroundColor: 'rgba(0,0,0,0.2)',
+    },
+    floatingWaitTimeBtnText: {
+        color: '#fff',
+        fontSize: 14,
+        fontWeight: '700',
+    },
+    // Locked wait time row (after pickup)
+    lockedWaitTimeRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        paddingVertical: 8,
+    },
+    lockedWaitTimeLabel: {
+        fontSize: 14,
+        fontWeight: '500',
+    },
+    lockedWaitTimeValue: {
+        fontSize: 16,
+        fontWeight: '700',
+    },
+    recurringBanner: {
+        backgroundColor: '#FFF3E0',
+        borderLeftWidth: 4,
+        borderLeftColor: '#FF9800',
+        paddingVertical: 10,
+        paddingHorizontal: 12,
+        marginTop: 10,
+        borderRadius: 4,
+    },
+    recurringBannerTitle: {
+        fontSize: 16,
+        fontWeight: '700',
+        color: '#E65100',
+        marginBottom: 4,
+    },
+    recurringBannerDetails: {
+        fontSize: 14,
+        color: '#EF6C00',
+        fontWeight: '600',
     },
 });
 

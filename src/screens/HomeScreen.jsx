@@ -32,7 +32,6 @@ import {
     Text,
     TouchableOpacity,
     StyleSheet,
-    Alert,
     SafeAreaView
 } from 'react-native';
 
@@ -46,25 +45,43 @@ import NotificationsScreen from './NotificationsScreen';
 import MessagingScreen from './MessagingScreen';
 import CurrentCallScreen from './CurrentCallScreen';
 import RideHistoryScreen from './RideHistoryScreen';
+import ChangePasswordScreen from '../components/ChangePasswordScreen';
+import ErrorBoundary from '../components/ErrorBoundary';
 import signalRService from '../services/signalRService';
 import { useAuth } from '../contexts/AuthContext';
+import { useAlert } from '../contexts/AlertContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useWaitTime } from '../contexts/WaitTimeContext';
-import { communicationAPI } from '../services/apiService';
+import { useNotifications } from '../contexts/NotificationContext';
+import { communicationAPI, ridesAPI } from '../services/apiService';
 
 const HomeScreen = () => {
     const { user } = useAuth();
     const { theme } = useTheme();
     const colors = theme.colors;
-    const { isTimerRunning, formattedTime, startTimer, stopTimer, clearTimer } = useWaitTime();
+    const {
+        isTimerRunning,
+        formattedTime,
+        activeRideId,
+        timerState,
+        pauseTimer,
+        resumeTimer,
+        resetTimer
+    } = useWaitTime();
+    const { pendingNavigation, clearPendingNavigation } = useNotifications();
+    const { showAlert } = useAlert();
 
     // ALL useState hooks at the very top
     const [activeTab, setActiveTab] = useState('calls');
     const [unreadCount, setUnreadCount] = useState(0);
+    const [assignedCallsCount, setAssignedCallsCount] = useState(0);
     const [activeCallId, setActiveCallId] = useState(null);
     const [viewingActiveCall, setViewingActiveCall] = useState(true);
     const [messagePrefill, setMessagePrefill] = useState("");
     const [openedMessagingFromCall, setOpenedMessagingFromCall] = useState(false);
+
+    // State for scrolling to a specific ride (from push notification)
+    const [scrollToRideId, setScrollToRideId] = useState(null);
 
     // Ref to track active call ID for SignalR callbacks (avoids stale closure)
     const activeCallIdRef = useRef(null);
@@ -89,6 +106,46 @@ const HomeScreen = () => {
         }
     }, [activeTab, messagePrefill]);
 
+    // Handle navigation from push notifications
+    // When pendingNavigation changes, navigate to the appropriate tab
+    useEffect(() => {
+        if (pendingNavigation) {
+            console.log('📱 Handling pending navigation:', pendingNavigation);
+
+            switch (pendingNavigation.screen) {
+                case 'openCalls':
+                    // Navigate to Open Calls tab
+                    // Only if there's no active call or allow navigation anyway
+                    if (!activeCallId) {
+                        setActiveTab('calls');
+                    }
+                    // Set the rideId to scroll to (OpenCallsScreen will handle scrolling)
+                    if (pendingNavigation.rideId) {
+                        setScrollToRideId(pendingNavigation.rideId);
+                    }
+                    break;
+
+                case 'messages':
+                    // Navigate to Messages tab
+                    setActiveTab('messages');
+                    break;
+
+                case 'home':
+                    // Just go to the default tab (calls)
+                    if (!activeCallId) {
+                        setActiveTab('calls');
+                    }
+                    break;
+
+                default:
+                    console.log('Unknown navigation screen:', pendingNavigation.screen);
+            }
+
+            // Clear the pending navigation after handling
+            clearPendingNavigation();
+        }
+    }, [pendingNavigation, activeCallId, clearPendingNavigation]);
+
     // Set up SignalR listeners for call reassignment
     useEffect(() => {
         // Handle when THIS driver is removed from a call
@@ -102,7 +159,7 @@ const HomeScreen = () => {
 
             if (currentActiveId && receivedRideId === currentActiveId) {
                 // Show alert to driver
-                Alert.alert(
+                showAlert(
                     'Call Reassigned',
                     data.message || 'You have been removed from this call by dispatch.',
                     [
@@ -120,8 +177,38 @@ const HomeScreen = () => {
             }
         });
 
+        // Handle when a call is canceled (remove from open calls and active call)
+        const unsubscribeCanceled = signalRService.onCallCanceled((data) => {
+            console.log('CallCanceled received:', data);
+            console.log('Current activeCallIdRef:', activeCallIdRef.current);
+
+            // Check if this is our active call (compare as numbers to handle type differences)
+            const receivedRideId = Number(data.rideId);
+            const currentActiveId = Number(activeCallIdRef.current);
+
+            if (currentActiveId && receivedRideId === currentActiveId) {
+                // Show alert to driver
+                showAlert(
+                    'Call Canceled',
+                    data.message || 'This call has been canceled by dispatch.',
+                    [
+                        {
+                            text: 'OK',
+                            onPress: () => {
+                                // Close active call and return to open calls
+                                setActiveCallId(null);
+                                setViewingActiveCall(false);
+                                setActiveTab('calls');
+                            }
+                        }
+                    ]
+                );
+            }
+        });
+
         return () => {
             unsubscribeUnassigned();
+            unsubscribeCanceled();
         };
     }, []);
 
@@ -142,21 +229,54 @@ const HomeScreen = () => {
 
         fetchUnreadCount();
 
-        // Listen for new messages to increment unread count (always increment, even on messages tab)
-        // The MessagingScreen will call onUnreadCountChange to reset when messages are marked read
+        // Listen for new messages to increment unread count
+        // Don't increment if messaging screen is active - it will mark as read immediately
         const unsubscribeMessage = signalRService.onMessageReceived((messageData) => {
             console.log('New message received in HomeScreen:', messageData);
-            // Always increment - let MessagingScreen reset when opened/read
             // Only increment for dispatcher/broadcast messages, not our own
             // Handle both camelCase and PascalCase from server
             const from = (messageData.from || messageData.From || '').toLowerCase();
-            if (!from.startsWith('driver')) {
+            // Don't increment if on messaging screen - MessagingScreen will handle it
+            if (!from.startsWith('driver') && activeTabRef.current !== 'messages') {
                 setUnreadCount(prev => prev + 1);
             }
         });
 
         return () => {
             unsubscribeMessage();
+        };
+    }, [user]);
+
+    // Fetch assigned calls count on mount and listen for changes
+    useEffect(() => {
+        const fetchAssignedCallsCount = async () => {
+            if (user?.userId) {
+                try {
+                    const data = await ridesAPI.getAssignedByDriver(user.userId);
+                    setAssignedCallsCount(data?.length || 0);
+                } catch (error) {
+                    console.error('Error fetching assigned calls count:', error);
+                    setAssignedCallsCount(0);
+                }
+            }
+        };
+
+        fetchAssignedCallsCount();
+
+        // Listen for call assigned/unassigned to update count
+        const unsubscribeAssigned = signalRService.onCallAssigned((data) => {
+            console.log('Call assigned, refreshing count');
+            fetchAssignedCallsCount();
+        });
+
+        const unsubscribeUnassigned = signalRService.onCallUnassigned((data) => {
+            console.log('Call unassigned, refreshing count');
+            fetchAssignedCallsCount();
+        });
+
+        return () => {
+            unsubscribeAssigned();
+            unsubscribeUnassigned();
         };
     }, [user]);
 
@@ -236,6 +356,13 @@ const HomeScreen = () => {
     };
 
     /**
+     * Navigate to Change Password screen (called from Settings screen)
+     */
+    const handleNavigateToChangePassword = () => {
+        setActiveTab('changePassword');
+    };
+
+    /**
      * Go back to Settings screen
      */
     const handleBackToSettings = () => {
@@ -256,9 +383,15 @@ const HomeScreen = () => {
     const renderActiveScreen = () => {
         switch (activeTab) {
             case 'calls':
-                return <OpenCallsScreen />;
+                return (
+                    <OpenCallsScreen
+                        scrollToRideId={scrollToRideId}
+                        onScrollComplete={() => setScrollToRideId(null)}
+                        onNavigateToCars={handleManageCars}
+                    />
+                );
             case 'active':
-                return <ActiveCallsScreen onCallSelect={handleActiveCallSelect} />;
+                return <ActiveCallsScreen onCallSelect={handleActiveCallSelect} onCountChange={setAssignedCallsCount} />;
             case 'history':
                 return <RideHistoryScreen />;
             case 'cars':
@@ -287,11 +420,23 @@ const HomeScreen = () => {
                     />
                 );
             case 'accountDetails':
-                return <AccountDetailsScreen onBack={handleBackToSettings} />;
+                return <AccountDetailsScreen onBack={handleBackToSettings} onNavigateToChangePassword={handleNavigateToChangePassword} />;
             case 'notifications':
-                return <NotificationsScreen onBack={handleBackToSettings} />;
+                return (
+                    <ErrorBoundary onReset={handleBackToSettings}>
+                        <NotificationsScreen onBack={handleBackToSettings} />
+                    </ErrorBoundary>
+                );
+            case 'changePassword':
+                return <ChangePasswordScreen navigation={{ goBack: handleBackToSettings }} />;
             default:
-                return <OpenCallsScreen />;
+                return (
+                    <OpenCallsScreen
+                        scrollToRideId={scrollToRideId}
+                        onScrollComplete={() => setScrollToRideId(null)}
+                        onNavigateToCars={handleManageCars}
+                    />
+                );
         }
     };
 
@@ -326,9 +471,12 @@ const HomeScreen = () => {
             {/* Bottom Tab Bar */}
             <View style={[styles.tabBar, { backgroundColor: colors.tabBar, borderTopColor: colors.border }]}>
                 {TABS.map((tab) => {
-                    const showBadge = tab.key === 'messages' && unreadCount > 0;
+                    const showMessagesBadge = tab.key === 'messages' && unreadCount > 0;
+                    const showActiveBadge = tab.key === 'active' && assignedCallsCount > 0;
+                    const badgeCount = tab.key === 'messages' ? unreadCount : (tab.key === 'active' ? assignedCallsCount : 0);
+                    const showBadge = showMessagesBadge || showActiveBadge;
                     const isActive = activeTab === tab.key ||
-                        (tab.key === 'settings' && ['settings', 'cars', 'accountDetails', 'notifications'].includes(activeTab));
+                        (tab.key === 'settings' && ['settings', 'cars', 'accountDetails', 'notifications', 'changePassword'].includes(activeTab));
                     return (
                         <TouchableOpacity
                             key={tab.key}
@@ -345,7 +493,7 @@ const HomeScreen = () => {
                                 {showBadge && (
                                     <View style={[styles.badge, { backgroundColor: colors.error }]}>
                                         <Text style={styles.badgeText}>
-                                            {unreadCount}
+                                            {badgeCount}
                                         </Text>
                                     </View>
                                 )}
@@ -362,18 +510,38 @@ const HomeScreen = () => {
                 })}
             </View>
 
-            {/* Floating Wait Time Timer Widget - shows only when timer is running */}
-            {isTimerRunning && (
+            {/* Floating Wait Time Timer Widget - shows when timer is active (running or paused) */}
+            {(timerState === 'waiting' || timerState === 'paused') && activeRideId && (
                 <View style={styles.floatingTimerContainer}>
-                    <View style={[styles.floatingTimer, { backgroundColor: '#2ecc71' }]}>
-                        <Text style={styles.floatingTimerIcon}>⏱️</Text>
-                        <Text style={styles.floatingTimerText}>{formattedTime}</Text>
-                        <TouchableOpacity
-                            style={styles.floatingTimerButton}
-                            onPress={stopTimer}
-                        >
-                            <Text style={styles.floatingTimerButtonText}>⏸</Text>
-                        </TouchableOpacity>
+                    <View style={[styles.floatingTimer, { backgroundColor: isTimerRunning ? '#e74c3c' : '#f39c12' }]}>
+                        <Text style={styles.floatingTimerLabel}>⏱️ WAIT TIME</Text>
+                        <View style={styles.floatingTimerInfo}>
+                            <Text style={styles.floatingTimerText}>{formattedTime}</Text>
+                            <Text style={styles.floatingTimerRideId}>Call #{activeRideId}</Text>
+                        </View>
+                        <View style={styles.floatingTimerButtons}>
+                            {isTimerRunning ? (
+                                <TouchableOpacity
+                                    style={styles.floatingTimerButton}
+                                    onPress={() => pauseTimer(activeRideId)}
+                                >
+                                    <Text style={styles.floatingTimerButtonText}>⏸</Text>
+                                </TouchableOpacity>
+                            ) : (
+                                <TouchableOpacity
+                                    style={styles.floatingTimerButton}
+                                    onPress={() => resumeTimer(activeRideId)}
+                                >
+                                    <Text style={styles.floatingTimerButtonText}>▶</Text>
+                                </TouchableOpacity>
+                            )}
+                            <TouchableOpacity
+                                style={[styles.floatingTimerButton, styles.floatingTimerResetButton]}
+                                onPress={() => resetTimer(activeRideId)}
+                            >
+                                <Text style={styles.floatingTimerButtonText}>↺</Text>
+                            </TouchableOpacity>
+                        </View>
                     </View>
                 </View>
             )}
@@ -478,16 +646,31 @@ const styles = StyleSheet.create({
         shadowRadius: 4,
         elevation: 5,
     },
-    floatingTimerIcon: {
-        fontSize: 16,
+    floatingTimerLabel: {
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: '700',
         marginRight: 6,
+    },
+    floatingTimerInfo: {
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+        marginRight: 8,
     },
     floatingTimerText: {
         color: '#fff',
         fontSize: 16,
         fontWeight: '700',
         fontVariant: ['tabular-nums'],
-        marginRight: 8,
+    },
+    floatingTimerRideId: {
+        color: 'rgba(255,255,255,0.85)',
+        fontSize: 11,
+        fontWeight: '500',
+    },
+    floatingTimerButtons: {
+        flexDirection: 'row',
+        gap: 4,
     },
     floatingTimerButton: {
         width: 28,
@@ -496,6 +679,9 @@ const styles = StyleSheet.create({
         backgroundColor: 'rgba(255,255,255,0.3)',
         justifyContent: 'center',
         alignItems: 'center',
+    },
+    floatingTimerResetButton: {
+        backgroundColor: 'rgba(0,0,0,0.2)',
     },
     floatingTimerButtonText: {
         color: '#fff',

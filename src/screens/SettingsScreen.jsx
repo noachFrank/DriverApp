@@ -5,7 +5,7 @@
  * Each row navigates to a sub-screen or toggles a setting.
  */
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
     View,
     Text,
@@ -13,10 +13,17 @@ import {
     StyleSheet,
     ScrollView,
     Switch,
-    Alert
+    Modal
 } from 'react-native';
 import { useAuth } from '../contexts/AuthContext';
 import { useTheme } from '../contexts/ThemeContext';
+import { useAlert } from '../contexts/AlertContext';
+import {
+    getPreferredMapsApp,
+    setPreferredMapsApp,
+    getAvailableMapsOptions,
+    MAPS_APP_LABELS
+} from '../services/mapsService';
 
 const SettingsScreen = ({
     onNavigateToAccountDetails,
@@ -26,10 +33,31 @@ const SettingsScreen = ({
     const { user, logout } = useAuth();
     const { theme, isDarkMode, toggleTheme } = useTheme();
     const colors = theme.colors;
+    const { showAlert } = useAlert();
+
+    // Maps preference state
+    const [preferredMapsApp, setPreferredMapsAppState] = useState('default');
+    const [showMapsModal, setShowMapsModal] = useState(false);
+
+    // Load maps preference on mount
+    useEffect(() => {
+        const loadMapsPreference = async () => {
+            const pref = await getPreferredMapsApp();
+            setPreferredMapsAppState(pref);
+        };
+        loadMapsPreference();
+    }, []);
+
+    // Handle maps app selection
+    const handleMapsAppSelect = async (appValue) => {
+        await setPreferredMapsApp(appValue);
+        setPreferredMapsAppState(appValue);
+        setShowMapsModal(false);
+    };
 
     // Handle logout with confirmation
     const handleLogout = () => {
-        Alert.alert(
+        showAlert(
             'Logout',
             'Are you sure you want to logout?',
             [
@@ -74,26 +102,7 @@ const SettingsScreen = ({
     return (
         <ScrollView style={[styles.container, { backgroundColor: colors.background }]}>
             {/* Profile Summary */}
-            <TouchableOpacity
-                style={[styles.profileCard, { backgroundColor: colors.card }]}
-                onPress={onNavigateToAccountDetails}
-                activeOpacity={0.6}
-            >
-                <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
-                    <Text style={styles.avatarText}>
-                        {user?.name ? user.name.charAt(0).toUpperCase() : '?'}
-                    </Text>
-                </View>
-                <View style={styles.profileInfo}>
-                    <Text style={[styles.profileName, { color: colors.text }]}>
-                        {user?.name || 'Driver'}
-                    </Text>
-                    <Text style={[styles.profileSubtitle, { color: colors.textMuted }]}>
-                        View account details
-                    </Text>
-                </View>
-                <Text style={[styles.rowArrow, { color: colors.textMuted }]}>›</Text>
-            </TouchableOpacity>
+
 
             {/* Account Section */}
             <SectionHeader title="ACCOUNT" />
@@ -120,6 +129,12 @@ const SettingsScreen = ({
                     label="Notifications"
                     subtitle="Manage push notifications"
                     onPress={onNavigateToNotifications}
+                />
+                <SettingsRow
+                    icon="🗺️"
+                    label="Navigation App"
+                    subtitle={MAPS_APP_LABELS[preferredMapsApp] || 'System Default'}
+                    onPress={() => setShowMapsModal(true)}
                 />
                 <SettingsRow
                     icon="🌙"
@@ -165,6 +180,59 @@ const SettingsScreen = ({
 
             {/* Bottom spacing */}
             <View style={{ height: 40 }} />
+
+            {/* Maps App Selection Modal */}
+            <Modal
+                visible={showMapsModal}
+                transparent={true}
+                animationType="fade"
+                onRequestClose={() => setShowMapsModal(false)}
+            >
+                <TouchableOpacity
+                    style={styles.modalOverlay}
+                    activeOpacity={1}
+                    onPress={() => setShowMapsModal(false)}
+                >
+                    <View style={[styles.modalContent, { backgroundColor: colors.card }]}>
+                        <Text style={[styles.modalTitle, { color: colors.text }]}>
+                            Navigation App
+                        </Text>
+                        <Text style={[styles.modalSubtitle, { color: colors.textMuted }]}>
+                            Choose which app to open when tapping on addresses
+                        </Text>
+
+                        {getAvailableMapsOptions().map((option) => (
+                            <TouchableOpacity
+                                key={option.value}
+                                style={[
+                                    styles.modalOption,
+                                    { borderBottomColor: colors.divider },
+                                    preferredMapsApp === option.value && styles.modalOptionSelected
+                                ]}
+                                onPress={() => handleMapsAppSelect(option.value)}
+                            >
+                                <Text style={[
+                                    styles.modalOptionText,
+                                    { color: colors.text },
+                                    preferredMapsApp === option.value && { color: colors.primary, fontWeight: '600' }
+                                ]}>
+                                    {option.label}
+                                </Text>
+                                {preferredMapsApp === option.value && (
+                                    <Text style={{ color: colors.primary, fontSize: 18 }}>✓</Text>
+                                )}
+                            </TouchableOpacity>
+                        ))}
+
+                        <TouchableOpacity
+                            style={[styles.modalCancelButton, { backgroundColor: colors.background }]}
+                            onPress={() => setShowMapsModal(false)}
+                        >
+                            <Text style={[styles.modalCancelText, { color: colors.text }]}>Cancel</Text>
+                        </TouchableOpacity>
+                    </View>
+                </TouchableOpacity>
+            </Modal>
         </ScrollView>
     );
 };
@@ -267,6 +335,64 @@ const styles = StyleSheet.create({
         color: '#fff',
         fontSize: 17,
         fontWeight: '600',
+    },
+    // Modal styles
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: 20,
+    },
+    modalContent: {
+        width: '100%',
+        maxWidth: 340,
+        borderRadius: 16,
+        padding: 20,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 8,
+        elevation: 8,
+    },
+    modalTitle: {
+        fontSize: 20,
+        fontWeight: '600',
+        textAlign: 'center',
+        marginBottom: 8,
+    },
+    modalSubtitle: {
+        fontSize: 14,
+        textAlign: 'center',
+        marginBottom: 20,
+        lineHeight: 20,
+    },
+    modalOption: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        paddingVertical: 16,
+        paddingHorizontal: 12,
+        borderBottomWidth: 1,
+    },
+    modalOptionSelected: {
+        backgroundColor: 'rgba(0, 122, 255, 0.08)',
+        borderRadius: 8,
+        marginHorizontal: -12,
+        paddingHorizontal: 24,
+    },
+    modalOptionText: {
+        fontSize: 16,
+    },
+    modalCancelButton: {
+        marginTop: 16,
+        padding: 14,
+        borderRadius: 10,
+        alignItems: 'center',
+    },
+    modalCancelText: {
+        fontSize: 16,
+        fontWeight: '500',
     },
 });
 

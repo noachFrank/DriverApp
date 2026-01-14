@@ -23,7 +23,8 @@ import {
     StyleSheet,
     ActivityIndicator,
     KeyboardAvoidingView,
-    Platform
+    Platform,
+    Linking
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../contexts/AuthContext';
@@ -101,6 +102,7 @@ const LoginScreen = () => {
                 <TextInput
                     style={styles.input}
                     placeholder="Name or Email"
+                    placeholderTextColor="#999"
                     value={username}
                     onChangeText={setUsername}
                     autoCapitalize="none"
@@ -113,6 +115,7 @@ const LoginScreen = () => {
                     <TextInput
                         style={styles.passwordInput}
                         placeholder="Password"
+                        placeholderTextColor="#999"
                         value={password}
                         onChangeText={setPassword}
                         secureTextEntry={!showPassword}
@@ -144,6 +147,27 @@ const LoginScreen = () => {
                     ) : (
                         <Text style={styles.buttonText}>Login</Text>
                     )}
+                </TouchableOpacity>
+            </View>
+
+            {/* Become a Driver Section */}
+            <View style={styles.becomeDriverSection}>
+                <Text style={styles.becomeDriverTitle}>Want to become a driver?</Text>
+                <Text style={styles.becomeDriverText}>
+                    If you don't have an account yet, contact us to get started.
+                </Text>
+                <TouchableOpacity
+                    style={styles.contactButton}
+                    onPress={() => {
+                        const subject = encodeURIComponent('Interested in Becoming a Driver');
+                        const body = encodeURIComponent(
+                            `Hello,\n\nI am interested in becoming a driver for Shia's Transportation.\n\nPlease find my information below:\n\nFull Name: \nPhone Number: \nEmail: \nCity/Area: \nVehicle Type: \nYears of Driving Experience: \n\nI look forward to hearing from you.\n\nThank you!`
+                        );
+                        Linking.openURL(`mailto:contact@shiastransport.com?subject=${subject}&body=${body}`);
+                    }}
+                >
+                    <Ionicons name="mail-outline" size={20} color="#007AFF" style={{ marginRight: 8 }} />
+                    <Text style={styles.contactButtonText}>Contact Us</Text>
                 </TouchableOpacity>
             </View>
         </KeyboardAvoidingView>
@@ -187,26 +211,28 @@ const styles = StyleSheet.create({
         marginBottom: 30,
     },
     input: {
-        backgroundColor: '#f9f9f9',
+        backgroundColor: '#ffffff',
         borderWidth: 1,
         borderColor: '#ddd',
         borderRadius: 8,
         padding: 15,
         fontSize: 16,
         marginBottom: 15,
+        color: '#333',
     },
     passwordContainer: {
         position: 'relative',
         marginBottom: 15,
     },
     passwordInput: {
-        backgroundColor: '#f9f9f9',
+        backgroundColor: '#ffffff',
         borderWidth: 1,
         borderColor: '#ddd',
         borderRadius: 8,
         padding: 15,
         paddingRight: 50,
         fontSize: 16,
+        color: '#333',
     },
     eyeIcon: {
         position: 'absolute',
@@ -227,6 +253,38 @@ const styles = StyleSheet.create({
     buttonText: {
         color: '#ffffff',
         fontSize: 18,
+        fontWeight: '600',
+    },
+    becomeDriverSection: {
+        marginTop: 30,
+        padding: 20,
+        alignItems: 'center',
+    },
+    becomeDriverTitle: {
+        fontSize: 18,
+        fontWeight: '600',
+        color: '#333',
+        marginBottom: 8,
+    },
+    becomeDriverText: {
+        fontSize: 14,
+        color: '#666',
+        textAlign: 'center',
+        marginBottom: 15,
+    },
+    contactButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#f0f8ff',
+        borderWidth: 1,
+        borderColor: '#007AFF',
+        borderRadius: 8,
+        paddingVertical: 12,
+        paddingHorizontal: 24,
+    },
+    contactButtonText: {
+        color: '#007AFF',
+        fontSize: 16,
         fontWeight: '600',
     },
 });

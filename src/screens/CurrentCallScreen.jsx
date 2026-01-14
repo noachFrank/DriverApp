@@ -38,7 +38,7 @@ import {
 import { ridesAPI } from '../services/apiService';
 import signalRService from '../services/signalRService';
 import locationTrackingService from '../services/locationTrackingService';
-import { openAddressInMaps } from '../services/mapsService';
+import { openAddressInMaps, openMultiStopRoute } from '../services/mapsService';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useWaitTime } from '../contexts/WaitTimeContext';
@@ -183,6 +183,17 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
     const handleAddressPress = (address) => {
         if (!address) return;
         openAddressInMaps(address);
+    };
+
+    // Open full route with all stops in maps app
+    const handleOpenFullRoute = () => {
+        if (!call?.route) return;
+
+        const pickup = call.route.pickup;
+        const dropoff = call.route.dropOff;
+        const stops = getStops().map(s => s.address);
+
+        openMultiStopRoute(pickup, stops, dropoff);
     };
 
     // Maximum number of stops allowed per ride
@@ -553,7 +564,7 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                     <TouchableOpacity onPress={onBack} style={styles.headerBackButton}>
                         <Text style={[styles.headerBackText, { color: colors.headerText || '#007AFF' }]}>← Back</Text>
                     </TouchableOpacity>
-                    <Text style={[styles.headerTitle, { color: colors.headerText || '#333' }]}>Active Call</Text>
+                    <Text style={[styles.headerTitle, { color: colors.headerText || '#333' }]}>Current Call</Text>
                     <View style={styles.headerSpacer} />
                 </View>
 
@@ -837,6 +848,18 @@ const CurrentCallScreen = ({ rideId, onBack, onComplete, onMessage }) => {
                                 <Text style={styles.mapIcon}>🗺️</Text>
                             </View>
                         </TouchableOpacity>
+
+                        {/* Full Route Button - only show if there are stops */}
+                        {getStops().length > 0 && (
+                            <TouchableOpacity
+                                style={styles.fullRouteButton}
+                                onPress={handleOpenFullRoute}
+                            >
+                                <Text style={styles.fullRouteButtonIcon}>🧭</Text>
+                                <Text style={styles.fullRouteButtonText}>Open Full Route in Maps</Text>
+                                <Text style={styles.fullRouteButtonArrow}>→</Text>
+                            </TouchableOpacity>
+                        )}
 
                         {/* Round Trip indicator */}
                         {call.route?.roundTrip && (
@@ -1232,6 +1255,7 @@ const styles = StyleSheet.create({
         justifyContent: 'space-between',
         paddingHorizontal: 15,
         paddingVertical: 12,
+        paddingTop: 35,
         backgroundColor: '#fff',
         borderBottomWidth: 1,
         borderBottomColor: '#e0e0e0',
@@ -1368,6 +1392,31 @@ const styles = StyleSheet.create({
         fontSize: 14,
         color: '#856404',
         fontWeight: '500',
+    },
+    fullRouteButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#3498db',
+        paddingVertical: 14,
+        paddingHorizontal: 16,
+        borderRadius: 10,
+        marginTop: 10,
+        marginBottom: 5,
+    },
+    fullRouteButtonIcon: {
+        fontSize: 20,
+        marginRight: 10,
+    },
+    fullRouteButtonText: {
+        flex: 1,
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: '600',
+    },
+    fullRouteButtonArrow: {
+        color: '#fff',
+        fontSize: 18,
+        fontWeight: '600',
     },
     detailRow: {
         flexDirection: 'row',

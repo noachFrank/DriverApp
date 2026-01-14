@@ -2,33 +2,39 @@
  * SquareCardTokenizer.jsx
  * 
  * Square In-App Payments SDK integration for React Native.
- * Uses native Square SDK for secure card tokenization when available.
- * Falls back to manual entry in Expo Go (development mode).
+ * - Android: Uses native Square SDK for secure card tokenization
+ * - iOS: Uses WebView with Square Web Payments SDK (native SDK has CorePaymentCard.framework issues)
  * 
- * This component is PCI compliant when using native SDK.
+ * Both methods are PCI compliant - card details never touch our servers.
  */
 
 import React, { useEffect, useState } from 'react';
-import { View, StyleSheet, Text, TextInput, TouchableOpacity, Modal, ActivityIndicator, Alert } from 'react-native';
+import { View, StyleSheet, Text, TextInput, TouchableOpacity, Modal, ActivityIndicator, Alert, Platform } from 'react-native';
+import { WebView } from 'react-native-webview';
 import { useTheme } from '../contexts/ThemeContext';
+import config from '../config/apiConfig';
 
-// Try to import native Square SDK
+// Try to import native Square SDK - Only on Android
 let SQIPCardEntry = null;
 let SQIPCore = null;
 let nativeSDKAvailable = false;
 
-try {
-    const SquareSDK = require('react-native-square-in-app-payments');
-    SQIPCardEntry = SquareSDK.SQIPCardEntry;
-    SQIPCore = SquareSDK.SQIPCore;
-    nativeSDKAvailable = true;
-    console.log('✅ Square native SDK loaded');
-} catch (error) {
-    console.log('⚠️ Square native SDK not available, using fallback:', error.message);
-    nativeSDKAvailable = false;
+// Only try to load native SDK on Android - iOS uses WebView instead
+if (Platform.OS === 'android') {
+    try {
+        const SquareSDK = require('react-native-square-in-app-payments');
+        SQIPCardEntry = SquareSDK.SQIPCardEntry;
+        SQIPCore = SquareSDK.SQIPCore;
+        nativeSDKAvailable = true;
+        console.log('✅ Square native SDK loaded (Android)');
+    } catch (error) {
+        console.log('⚠️ Square native SDK not available on Android:', error.message);
+        nativeSDKAvailable = false;
+    }
 }
 
-const SQUARE_APP_ID = 'sandbox-sq0idb--YpQgluD9h8KuPogEWEhPQ';
+const SQUARE_APP_ID = 'sq0idp-HT7cBlmVVPanBhG6ls7vMw';
+const SQUARE_LOCATION_ID = 'L8Y3SJQSQPBZJ'; // Your Square location ID
 
 const SquareCardTokenizer = ({
     onTokenReceived,
@@ -36,26 +42,70 @@ const SquareCardTokenizer = ({
     rideId,
     amount
 }) => {
-    const { theme } = useTheme();
+    const { theme, isDarkMode } = useTheme();
     const [loading, setLoading] = useState(true);
     const [sdkInitialized, setSdkInitialized] = useState(false);
     const [showManualEntry, setShowManualEntry] = useState(false);
+    const [showWebView, setShowWebView] = useState(false);
 
-    // Manual entry state
+    // Manual entry state (for development/fallback)
     const [cardNumber, setCardNumber] = useState('');
     const [expiry, setExpiry] = useState('');
     const [cvv, setCvv] = useState('');
     const [submitting, setSubmitting] = useState(false);
 
     useEffect(() => {
-        if (nativeSDKAvailable) {
+        if (Platform.OS === 'ios') {
+            // iOS: Use WebView with Square Web Payments SDK
+            console.log('ℹ️ iOS detected - using WebView for Square payments');
+            setLoading(false);
+            setShowWebView(true);
+        } else if (nativeSDKAvailable) {
+            // Android: Use native SDK
             initializeNativeSDK();
         } else {
-            // Fallback to manual entry
+            // Fallback to manual entry (development mode)
             setLoading(false);
             setShowManualEntry(true);
         }
     }, []);
+
+    // Handle messages from WebView (iOS)
+    const handleWebViewMessage = (event) => {
+        try {
+            const data = JSON.parse(event.nativeEvent.data);
+            console.log('📱 WebView message received:', data);
+
+            if (data.type === 'success') {
+                onTokenReceived(data.token, {
+                    brand: data.cardDetails?.brand,
+                    lastFour: data.cardDetails?.lastFour,
+                    webPayments: true
+                });
+            } else if (data.type === 'cancel') {
+                onError('Payment cancelled', 'USER_CANCELED');
+            } else if (data.type === 'error') {
+                onError(data.error || 'Payment failed', data.code || 'PAYMENT_ERROR');
+            }
+        } catch (error) {
+            console.error('Failed to parse WebView message:', error);
+        }
+    };
+
+    // Build WebView URL for iOS
+    const getWebViewUrl = () => {
+        const baseUrl = config.API_BASE_URL.replace('/api', '');
+        const isProduction = !__DEV__; // React Native built-in
+        const params = new URLSearchParams({
+            amount: amount?.toString() || '0',
+            rideId: rideId?.toString() || '',
+            darkMode: isDarkMode ? 'true' : 'false',
+            appId: SQUARE_APP_ID,
+            locationId: SQUARE_LOCATION_ID,
+            production: isProduction ? 'true' : 'false'
+        });
+        return `${baseUrl}/square-payment.html?${params.toString()}`;
+    };
 
     const initializeNativeSDK = async () => {
         try {
@@ -233,6 +283,47 @@ const SquareCardTokenizer = ({
                     <Text style={[styles.loadingText, { color: theme.colors.text }]}>
                         Initializing secure payment...
                     </Text>
+                </View>
+            </Modal>
+        );
+    }
+
+    // iOS WebView with Square Web Payments SDK
+    if (showWebView) {
+        const webViewUrl = getWebViewUrl();
+        console.log('📱 Loading Square WebView:', webViewUrl);
+
+        return (
+            <Modal visible={true} animationType="slide" transparent={false} onRequestClose={handleCancel}>
+                <View style={[styles.webViewContainer, { backgroundColor: theme.colors.background }]}>
+                    <WebView
+                        source={{ uri: webViewUrl }}
+                        onMessage={handleWebViewMessage}
+                        onError={(syntheticEvent) => {
+                            const { nativeEvent } = syntheticEvent;
+                            console.error('WebView error:', nativeEvent);
+                            onError('Failed to load payment form', 'WEBVIEW_ERROR');
+                        }}
+                        onHttpError={(syntheticEvent) => {
+                            const { nativeEvent } = syntheticEvent;
+                            console.error('WebView HTTP error:', nativeEvent.statusCode);
+                            if (nativeEvent.statusCode >= 400) {
+                                onError('Failed to load payment form', 'HTTP_ERROR');
+                            }
+                        }}
+                        style={styles.webView}
+                        javaScriptEnabled={true}
+                        domStorageEnabled={true}
+                        startInLoadingState={true}
+                        renderLoading={() => (
+                            <View style={[styles.webViewLoading, { backgroundColor: theme.colors.background }]}>
+                                <ActivityIndicator size="large" color={theme.colors.primary} />
+                                <Text style={[styles.loadingText, { color: theme.colors.text }]}>
+                                    Loading secure payment form...
+                                </Text>
+                            </View>
+                        )}
+                    />
                 </View>
             </Modal>
         );
@@ -458,6 +549,23 @@ const styles = StyleSheet.create({
         textAlign: 'center',
         marginTop: 20,
         fontSize: 12,
+    },
+    // WebView styles (iOS)
+    webViewContainer: {
+        flex: 1,
+        paddingTop: Platform.OS === 'ios' ? 50 : 0, // Safe area for iOS
+    },
+    webView: {
+        flex: 1,
+    },
+    webViewLoading: {
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        justifyContent: 'center',
+        alignItems: 'center',
     },
 });
 

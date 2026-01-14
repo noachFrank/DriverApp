@@ -26,13 +26,14 @@
  * - CallAvailableAgain: A call became available → add to open calls list
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
     View,
     Text,
     TouchableOpacity,
     StyleSheet,
-    SafeAreaView
+    SafeAreaView,
+    BackHandler
 } from 'react-native';
 
 // Import tab screens
@@ -83,6 +84,9 @@ const HomeScreen = () => {
     // State for scrolling to a specific ride (from push notification)
     const [scrollToRideId, setScrollToRideId] = useState(null);
 
+    // Navigation history for back button support
+    const [navigationHistory, setNavigationHistory] = useState(['calls']);
+
     // Ref to track active call ID for SignalR callbacks (avoids stale closure)
     const activeCallIdRef = useRef(null);
 
@@ -97,6 +101,32 @@ const HomeScreen = () => {
     useEffect(() => {
         activeTabRef.current = activeTab;
     }, [activeTab]);
+
+    // Handle Android back button
+    useEffect(() => {
+        const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
+            // If viewing active call, go back to previous tab
+            if (activeCallId && viewingActiveCall) {
+                setViewingActiveCall(false);
+                return true; // Prevent default (exiting app)
+            }
+
+            // If we have navigation history, go back
+            if (navigationHistory.length > 1) {
+                const newHistory = [...navigationHistory];
+                newHistory.pop(); // Remove current
+                const previousTab = newHistory[newHistory.length - 1];
+                setNavigationHistory(newHistory);
+                setActiveTab(previousTab);
+                return true; // Prevent default (exiting app)
+            }
+
+            // No history - allow default behavior (exit app or go to home)
+            return false;
+        });
+
+        return () => backHandler.remove();
+    }, [navigationHistory, activeCallId, viewingActiveCall]);
 
     // Clear messagePrefill when switching away from messages tab
     useEffect(() => {
@@ -338,6 +368,7 @@ const HomeScreen = () => {
      * Navigate to Car Management screen (called from Settings screen)
      */
     const handleManageCars = () => {
+        setNavigationHistory(prev => [...prev, 'cars']);
         setActiveTab('cars');
     };
 
@@ -345,6 +376,7 @@ const HomeScreen = () => {
      * Navigate to Account Details screen (called from Settings screen)
      */
     const handleNavigateToAccountDetails = () => {
+        setNavigationHistory(prev => [...prev, 'accountDetails']);
         setActiveTab('accountDetails');
     };
 
@@ -352,6 +384,7 @@ const HomeScreen = () => {
      * Navigate to Notifications screen (called from Settings screen)
      */
     const handleNavigateToNotifications = () => {
+        setNavigationHistory(prev => [...prev, 'notifications']);
         setActiveTab('notifications');
     };
 
@@ -359,13 +392,20 @@ const HomeScreen = () => {
      * Navigate to Change Password screen (called from Settings screen)
      */
     const handleNavigateToChangePassword = () => {
+        setNavigationHistory(prev => [...prev, 'changePassword']);
         setActiveTab('changePassword');
     };
 
     /**
-     * Go back to Settings screen
+     * Go back to Settings screen (used by sub-screens)
      */
     const handleBackToSettings = () => {
+        // Remove current screen from history and go back to settings
+        setNavigationHistory(prev => {
+            const newHistory = [...prev];
+            newHistory.pop(); // Remove current sub-screen
+            return newHistory;
+        });
         setActiveTab('settings');
     };
 
@@ -451,6 +491,10 @@ const HomeScreen = () => {
 
     // Handle tab press
     const handleTabPress = (tabKey) => {
+        // Add to navigation history (avoid duplicates at top of stack)
+        if (navigationHistory[navigationHistory.length - 1] !== tabKey) {
+            setNavigationHistory(prev => [...prev, tabKey]);
+        }
         setActiveTab(tabKey);
     };
 
@@ -574,7 +618,7 @@ const styles = StyleSheet.create({
         backgroundColor: '#fff',
         borderTopWidth: 1,
         borderTopColor: '#e0e0e0',
-        paddingBottom: 20, // Extra padding for home indicator on newer phones
+        paddingBottom: 40, // Extra padding for home indicator and system nav buttons
         paddingTop: 10,
     },
     tab: {

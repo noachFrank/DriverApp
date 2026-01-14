@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Config files with sensitive data
+src/config/environment.js
+src/config/googleMapsConfig.js

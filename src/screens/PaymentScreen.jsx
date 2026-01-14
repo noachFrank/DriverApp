@@ -768,10 +768,10 @@ const PaymentScreen = ({ rideId, cost = 0, paymentType = 'Cash', call = null, wa
                             </Text>
                             <View style={[styles.zelleRecipient, { backgroundColor: colors.background }]}>
                                 <Text style={[styles.zelleEmail, { color: colors.primary }]}>
-                                    payments@dispatch.com
+                                    Shiastransportation@gmail.com
                                 </Text>
                                 <Text style={[styles.zelleNote, { color: colors.textSecondary }]}>
-                                    Include Ride #{rideId} in the memo
+                                    Include the phone number in the memo
                                 </Text>
                             </View>
                             <Text style={[styles.zelleStep, { color: colors.text }]}>
